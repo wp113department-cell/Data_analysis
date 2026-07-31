@@ -1,5 +1,9 @@
 # AI Data Analyst Agent
 
+[![Try it live](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://analysiscsv.streamlit.app/)
+
+**🔗 Try it live: [analysiscsv.streamlit.app](https://analysiscsv.streamlit.app/)** - upload your own CSV or use one from `data/` and ask it anything.
+
 A simple, working demo of an AI agent that analyzes CSV data end-to-end: upload a file, ask a question in plain English, and get statistics, charts, AI-written insights, and a downloadable markdown report - all running locally with **Streamlit**, **LangChain**, **LangGraph**, and the **Groq** API.
 
 This project is built as a clean demonstration of how **LangChain** (LLM calls) and **LangGraph** (agent orchestration) work together in a real multi-agent pipeline.
