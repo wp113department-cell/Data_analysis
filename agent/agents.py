@@ -4,7 +4,7 @@ agents.py
 This file holds ALL the LangChain-related code for the AI Data Analyst Agent.
 
 LangChain is used ONLY for:
-    - Talking to the Groq LLM (llama-3.3-70b-versatile)
+    - Talking to the Groq LLM (openai/gpt-oss-120b)
     - Prompt templates
     - Structured output (turning free text into a validated Python object)
     - Output parsing
@@ -37,7 +37,7 @@ from pydantic import BaseModel, Field
 
 load_dotenv()
 
-GROQ_MODEL_NAME = "llama-3.3-70b-versatile"
+GROQ_MODEL_NAME = "openai/gpt-oss-120b"
 ALLOWED_CHART_TYPES = ["bar", "histogram", "pie", "scatter"]
 
 
