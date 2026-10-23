@@ -1,4 +1,4 @@
-# AI Data Analyst Agent
+# Data Analysis Automation — Agentic Workflow
 
 [![Try it live](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://analysiscsv.streamlit.app/)
 

@@ -36,7 +36,7 @@ statistics  visualization      <- run in parallel
 from __future__ import annotations
 
 import tempfile
-from typing import Any, Dict, List, Optional, TypedDict
+from typing import Any, Dict, Iterator, List, Optional, Tuple, TypedDict
 
 import pandas as pd
 from langgraph.graph import END, START, StateGraph
@@ -153,3 +153,24 @@ def run_analysis(df: pd.DataFrame, user_question: str) -> AgentState:
 
     final_state = compiled_graph.invoke(initial_state)
     return final_state
+
+
+def stream_analysis(df: pd.DataFrame, user_question: str) -> Iterator[Tuple[str, AgentState]]:
+    """
+    Same as run_analysis, but yields (node_name, state_so_far) each time a
+    node finishes, so the UI can show live progress through the pipeline.
+    The state from the last yield is the complete final state.
+    """
+    compiled_graph = build_graph()
+    chart_dir = tempfile.mkdtemp(prefix="ai_data_analyst_charts_")
+
+    state: AgentState = {
+        "user_question": user_question,
+        "dataframe": df,
+        "chart_dir": chart_dir,
+    }
+
+    for update in compiled_graph.stream(state, stream_mode="updates"):
+        for node_name, node_output in update.items():
+            state.update(node_output or {})
+            yield node_name, state
