@@ -1,12 +1,13 @@
 [theme]
 base = "light"
-primaryColor = "#4F46E5"
-backgroundColor = "#F8FAFC"
-secondaryBackgroundColor = "#EEF2FF"
-textColor = "#0F172A"
-borderColor = "#E2E8F0"
-baseRadius = "0.6rem"
-font = "Inter:https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap"
+primaryColor = "#2B1745"
+backgroundColor = "#FBF7F1"
+secondaryBackgroundColor = "#F3EEFF"
+textColor = "#1C0F2D"
+borderColor = "#D9CFEA"
+baseRadius = "0.9rem"
+font = "Plus Jakarta Sans:https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap"
+codeFont = "JetBrains Mono:https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&display=swap"
 
 [client]
 toolbarMode = "minimal"
@@ -15,7 +16,7 @@ toolbarMode = "minimal"
 maxUploadSize = 200
 
 [theme.sidebar]
-backgroundColor = "#0F172A"
-secondaryBackgroundColor = "#1E293B"
-textColor = "#E2E8F0"
-borderColor = "#334155"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F3EEFF"
+textColor = "#2B1745"
+borderColor = "#F2F1EF"

@@ -1,263 +1,180 @@
 """
 main.py
 -------
-Streamlit UI for Data Analysis Automation - an agentic workflow.
+Streamlit chat UI for Helper Quote - an agentic quoting assistant.
 
-This file is intentionally "dumb": it only handles page layout, user input,
-and displaying results. All the real work happens in:
-    - agent/agents.py  (LangChain: LLM calls, prompts, structured output)
-    - agent/graph.py   (LangGraph: orchestration of the agent pipeline)
+This file only handles the page: sidebar, chat bubbles, live progress and the
+quote card. The agent (LangGraph) lives in agent/graph.py, its tools in
+agent/quote_tools.py and its memory in agent/memory.py.
 """
 
 from __future__ import annotations
 
-import shutil
+import base64
+import json
+import os
 import time
+import uuid
+from datetime import date
 from pathlib import Path
 
-import pandas as pd
 import streamlit as st
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langgraph.types import Command
 
-from agent import agents
-from agent.graph import stream_analysis
+from agent import agents, memory
+from agent.graph import get_graph, run_config
+from agent.quote_document import render_quote_pdf
+from agent.quote_tools import TOOL_LABELS
+from agent.rate_limit import AllModelsBusy
+from agent.sheets import get_workbooks
 
-APP_NAME = "Data Analysis Automation"
-APP_TAGLINE = "Agentic Workflow"
-DATA_DIR = Path(__file__).parent / "data"
+AVATAR = str(Path(__file__).parent / "assets" / "helper_avatar.svg")
+AVATAR_DATA_URI = "data:image/svg+xml;base64," + base64.b64encode(Path(AVATAR).read_bytes()).decode()
 
-st.set_page_config(
-    page_title=f"{APP_NAME} · {APP_TAGLINE}",
-    page_icon=":material/insights:",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
+st.set_page_config(page_title="Helper Quote", page_icon=AVATAR, layout="centered")
 
-EXAMPLE_QUESTIONS = [
-    "Summarize this dataset.",
-    "Generate business insights.",
-    "Which product generated the highest revenue?",
-    "Show monthly revenue.",
-    "What are the top five products?",
-    "Which customer spent the most?",
-    "Which city generated the highest revenue?",
-    "Show the distribution of sales.",
-    "Are there any missing values?",
+SUGGESTIONS = [
+    "I need a quote for 2 W2136 in white shaker",
+    "What colors do you offer?",
+    "L-shaped kitchen, 12' and 14' walls - countertop estimate?",
+    "I have a quote already - can you update it?",
 ]
-
-# node name in agent/graph.py -> (display label, what it does)
-PIPELINE_STEPS = {
-    "planner": ("Planner", "turned the question into a structured analysis plan"),
-    "statistics": ("Statistics", "computed exact summaries and group-bys"),
-    "visualization": ("Visualization", "rendered charts in parallel with statistics"),
-    "insight": ("Insights", "wrote business insights from the numbers"),
-    "report": ("Report", "assembled the final report"),
-}
 
 CUSTOM_CSS = """
 <style>
-.block-container { padding-top: 2rem; padding-bottom: 3rem; max-width: 1280px; }
+:root {
+  --ink: #1C0F2D; --plum: #2B1745; --plum-2: #5A4880; --muted: #8A7FA0;
+  --cream: #FBF7F1; --sand: #F2F1EF; --lav: #F3EEFF; --lav-2: #D9CFEA;
+  --khaki: #FFE07A; --khaki-soft: #FFF3C4; --pink: #FF9BAE; --pink-soft: #FFE4EA;
+  --green: #1F7A4D; --mint: #52E0A8;
+  --mono: "JetBrains Mono", ui-monospace, monospace;
+}
+.block-container { padding-top: 1.6rem; padding-bottom: 7rem; max-width: 820px; }
 [data-testid="stAppDeployButton"], footer { display: none; }
 
-/* Hero */
-.hero {
-    background: linear-gradient(135deg, #1E1B4B 0%, #312E81 45%, #4F46E5 100%);
-    border-radius: 16px;
-    padding: 2rem 2.25rem;
-    color: #FFFFFF;
-    margin-bottom: 1.5rem;
-    box-shadow: 0 10px 30px -12px rgba(49, 46, 129, 0.45);
-}
-.hero-eyebrow {
-    display: inline-block;
-    font-size: 0.72rem; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase;
-    background: rgba(255, 255, 255, 0.14); border: 1px solid rgba(255, 255, 255, 0.22);
-    padding: 0.25rem 0.7rem; border-radius: 999px; margin-bottom: 0.9rem;
-}
-.hero-title { font-size: 2.1rem; font-weight: 700; line-height: 1.15; margin: 0 0 0.5rem 0; }
-.hero-title span { color: #A5B4FC; }
-.hero-sub { font-size: 1rem; opacity: 0.85; max-width: 760px; margin: 0; }
-.hero-tags { margin-top: 1.1rem; display: flex; flex-wrap: wrap; gap: 0.5rem; }
-.hero-tag {
-    font-size: 0.78rem; font-weight: 500;
-    background: rgba(255, 255, 255, 0.10); border-radius: 6px; padding: 0.2rem 0.6rem;
-}
+/* Top bar */
+.topbar { display: flex; justify-content: space-between; align-items: flex-end; gap: 1rem; margin-bottom: 1.2rem; }
+.eyebrow { font-family: var(--mono); font-size: 0.72rem; letter-spacing: 0.18em; text-transform: uppercase; color: var(--muted); }
+.title { font-size: 2.1rem; font-weight: 800; letter-spacing: -0.03em; color: var(--ink); line-height: 1.1; }
+.live { display: flex; align-items: center; gap: 0.6rem; }
+.live-pill { display: flex; align-items: center; gap: 0.55rem; background: #FFFFFF; border: 1px solid var(--lav-2);
+  border-radius: 999px; padding: 0.4rem 0.85rem; font-family: var(--mono); font-size: 0.72rem;
+  letter-spacing: 0.14em; color: var(--green); }
+.live-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--mint); box-shadow: 0 0 0 0 rgba(82,224,168,.6);
+  animation: hq-pulse 1.8s infinite; }
+.live-face { width: 40px; height: 40px; border-radius: 50%; background: var(--khaki); display: flex;
+  align-items: center; justify-content: center; }
+.live-face img { width: 30px; height: 30px; animation: hq-bob 2.6s ease-in-out infinite; }
 
-/* Section headings */
-.section-title { font-size: 1.15rem; font-weight: 600; margin: 0.25rem 0 0.15rem 0; }
-.section-sub { font-size: 0.88rem; color: #64748B; margin-bottom: 0.75rem; }
+/* Chat rows */
+[data-testid="stChatMessage"] { background: transparent !important; padding: 0.3rem 0; gap: 0.6rem; }
+[data-testid="stChatMessageAvatarUser"] { display: none; }
+[data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarUser"]) { flex-direction: row-reverse; }
+[data-testid="stChatMessageAvatarCustom"] { width: 2.5rem; height: 2.5rem; background: transparent;
+  animation: hq-bob 2.6s ease-in-out infinite; }
+[data-testid="stChatMessageAvatarCustom"] img { width: 100%; height: 100%; }
+[data-testid="stChatMessage"]:has(.st-key-thinking_now) [data-testid="stChatMessageAvatarCustom"] {
+  animation: hq-jump 0.7s ease-in-out infinite; }
 
-/* Metric cards */
-[data-testid="stMetric"] {
-    background: #FFFFFF;
-    border: 1px solid #E2E8F0;
-    border-radius: 12px;
-    padding: 0.9rem 1rem;
-    box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
-}
-[data-testid="stMetricLabel"] p { font-size: 0.78rem; font-weight: 600; color: #64748B; text-transform: uppercase; letter-spacing: 0.04em; }
-[data-testid="stMetricValue"] { font-size: 1.6rem; font-weight: 700; color: #0F172A; }
+/* Bubbles */
+[class*="st-key-umsg"] { background: var(--sand); color: var(--ink); border-radius: 20px 20px 6px 20px;
+  padding: 0.7rem 1.05rem; width: fit-content !important; max-width: 80%; margin-left: auto; }
+[class*="st-key-amsg"] { background: var(--plum); border-radius: 20px 20px 20px 6px; padding: 0.8rem 1.1rem;
+  width: fit-content !important; max-width: 90%; box-shadow: 0 8px 22px -14px rgba(43,23,69,.6); }
+[class*="st-key-amsg"] :is(p, li, strong, em, span, h1, h2, h3, h4, td, th, code) { color: #FFFFFF !important; }
+[class*="st-key-amsg"] a { color: var(--khaki) !important; }
+[class*="st-key-amsg"] [data-testid="stMarkdownContainer"] p, [class*="st-key-umsg"] [data-testid="stMarkdownContainer"] p {
+  margin: 0 0 0.45rem 0; }
+[class*="st-key-amsg"] [data-testid="stMarkdownContainer"] > :last-child,
+[class*="st-key-umsg"] [data-testid="stMarkdownContainer"] > :last-child { margin-bottom: 0; }
+[class*="st-key-amsg"] [data-testid="stMarkdownContainer"], [class*="st-key-umsg"] [data-testid="stMarkdownContainer"],
+[class*="st-key-quote"] [data-testid="stMarkdownContainer"] { margin-bottom: 0 !important; }
+[class*="st-key-amsg"], [class*="st-key-umsg"] { overflow: visible; gap: 0 !important; }
+.chosen { display: inline-block; background: var(--lav); color: var(--plum-2); border-radius: 999px;
+  padding: 0.25rem 0.8rem; font-weight: 600; font-size: 0.9rem; }
 
-/* Pipeline diagram */
-.pipeline { display: flex; align-items: center; gap: 0.6rem; flex-wrap: wrap; margin: 0.25rem 0 0.5rem 0; }
-.pipe-col { display: flex; flex-direction: column; gap: 0.45rem; }
-.pipe-node {
-    display: flex; align-items: center; gap: 0.5rem;
-    background: #FFFFFF; border: 1px solid #E2E8F0; border-radius: 10px;
-    padding: 0.55rem 0.85rem; font-size: 0.86rem; font-weight: 600; color: #334155;
-    min-width: 132px;
-}
-.pipe-node .dot { width: 8px; height: 8px; border-radius: 50%; background: #CBD5E1; flex-shrink: 0; }
-.pipe-node.done { border-color: #A5B4FC; background: #EEF2FF; color: #312E81; }
-.pipe-node.done .dot { background: #4F46E5; box-shadow: 0 0 0 3px rgba(79, 70, 229, 0.18); }
-.pipe-arrow { color: #94A3B8; font-size: 1.1rem; }
+/* Quote card (khaki, like a booking banner) */
+[class*="st-key-quote"] { background: var(--khaki-soft); border: 1.5px solid var(--khaki); border-radius: 20px;
+  padding: 1rem 1.15rem; }
+.quote-head { display: flex; justify-content: space-between; align-items: baseline; gap: 1rem; flex-wrap: wrap; }
+.quote-no { font-family: var(--mono); font-size: 0.74rem; font-weight: 500; color: var(--plum-2);
+  letter-spacing: 0.14em; text-transform: uppercase; }
+.quote-total { font-size: 1.6rem; font-weight: 800; color: var(--ink); }
+.quote-meta { font-size: 0.86rem; color: var(--plum-2); }
+.quote-badge { display: inline-block; background: var(--khaki); color: var(--ink); font-weight: 700;
+  border-radius: 999px; padding: 0.15rem 0.7rem; font-size: 0.78rem; margin-left: 0.4rem; }
 
-/* Feature cards on the empty state */
-.feature {
-    background: #FFFFFF; border: 1px solid #E2E8F0; border-radius: 12px;
-    padding: 1.1rem 1.2rem; height: 100%;
-}
-.feature-step { font-size: 0.72rem; font-weight: 700; color: #4F46E5; letter-spacing: 0.08em; text-transform: uppercase; }
-.feature-title { font-size: 1rem; font-weight: 600; margin: 0.3rem 0 0.25rem 0; color: #0F172A; }
-.feature-text { font-size: 0.87rem; color: #64748B; margin: 0; }
+/* Thinking / status */
+[data-testid="stChatMessage"] [data-testid="stExpander"] details { border: 1px dashed var(--lav-2); background: #FFFFFF80; border-radius: 14px; }
+[data-testid="stChatMessage"] [data-testid="stExpander"] summary p { font-size: 0.82rem; color: var(--muted); }
+
+/* Option chips */
+[data-testid="stBaseButton-pills"] { background: var(--lav) !important; color: var(--plum-2) !important;
+  border: 1px solid transparent !important; font-weight: 600; border-radius: 12px !important; }
+[data-testid="stBaseButton-pills"]:hover { border-color: var(--lav-2) !important; color: var(--plum) !important; }
+[data-testid="stBaseButton-pillsActive"] { background: var(--plum) !important; color: #FFFFFF !important; border-radius: 12px !important; }
+
+/* Composer */
+[data-testid="stBottom"] > div { background: var(--cream); }
+[data-testid="stChatInput"], [data-testid="stChatInput"] > div, [data-testid="stChatInputTextArea"] {
+  background: #FFFDF8 !important; }
+[data-testid="stChatInput"] { border: 1px solid var(--lav-2); border-radius: 16px; box-shadow: 0 6px 20px -14px rgba(43,23,69,.35); }
+[data-testid="stChatInputSubmitButton"] { background: var(--plum) !important; color: #FFFFFF !important; border-radius: 999px !important; }
 
 /* Sidebar */
-.brand { display: flex; align-items: center; gap: 0.7rem; margin: 0.25rem 0 1.25rem 0; }
-.brand-logo {
-    width: 38px; height: 38px; border-radius: 10px;
-    background: linear-gradient(135deg, #6366F1, #4338CA);
-    display: flex; align-items: center; justify-content: center;
-    font-weight: 700; font-size: 0.95rem; color: #FFFFFF !important;
-}
-.brand-name { font-weight: 700; font-size: 0.98rem; line-height: 1.2; }
-.brand-tag { font-size: 0.75rem; color: #94A3B8 !important; }
-.side-label {
-    font-size: 0.7rem; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase;
-    color: #94A3B8 !important; margin: 0.4rem 0 0.4rem 0;
-}
-.status-pill {
-    display: flex; align-items: center; gap: 0.5rem;
-    background: #1E293B; border: 1px solid #334155; border-radius: 8px;
-    padding: 0.5rem 0.7rem; font-size: 0.84rem; margin-bottom: 0.45rem;
-}
-.status-pill .led { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
-.led.ok { background: #22C55E; box-shadow: 0 0 0 3px rgba(34, 197, 94, 0.2); }
-.led.bad { background: #F59E0B; box-shadow: 0 0 0 3px rgba(245, 158, 11, 0.2); }
-.status-pill .k { color: #94A3B8 !important; margin-right: auto; }
+[data-testid="stSidebar"] { border-right: 1px solid var(--sand); }
+.brand { display: flex; align-items: center; gap: 0.7rem; margin: 0.2rem 0 1rem 0; padding: 0.7rem 0.8rem;
+  border: 1px solid var(--sand); border-radius: 16px; background: var(--cream); }
+.brand img { width: 38px; height: 38px; animation: hq-bob 2.6s ease-in-out infinite; }
+.brand-name { font-weight: 800; font-size: 0.98rem; line-height: 1.2; color: var(--ink); }
+.brand-tag { font-size: 0.76rem; color: var(--green) !important; display: flex; align-items: center; gap: 0.35rem; }
+.side-label { font-family: var(--mono); font-size: 0.68rem; letter-spacing: 0.16em; text-transform: uppercase;
+  color: var(--muted) !important; margin: 1rem 0 0.4rem 0.2rem; }
+[class*="st-key-thread_"] button { background: transparent; border: none; justify-content: flex-start; padding-left: 0.7rem; }
+[class*="st-key-thread_"] button > div { justify-content: flex-start; width: 100%; }
+[class*="st-key-thread_"] button p { text-align: left; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  font-weight: 600; color: var(--plum); }
+[class*="st-key-thread_"] [data-testid="stBaseButton-primary"] { background: var(--lav) !important; }
+[class*="st-key-thread_"] button:hover { background: var(--cream); }
+.status-pill { display: flex; align-items: center; gap: 0.5rem; background: var(--cream); border: 1px solid var(--sand);
+  border-radius: 12px; padding: 0.45rem 0.75rem; font-size: 0.8rem; margin-bottom: 0.4rem; color: var(--plum); }
+.status-pill .led { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
+.led.ok { background: var(--mint); } .led.bad { background: var(--khaki); }
+.status-pill .k { color: var(--muted) !important; margin-right: auto; font-family: var(--mono); font-size: 0.72rem; }
 
-/* Answer card */
-.answer-q { font-size: 0.8rem; font-weight: 600; color: #64748B; text-transform: uppercase; letter-spacing: 0.05em; }
-
-/* Tabs */
-.stTabs [data-baseweb="tab-list"] { gap: 0.25rem; border-bottom: 1px solid #E2E8F0; }
-.stTabs [data-baseweb="tab"] { padding: 0.5rem 0.9rem; font-weight: 500; }
+@keyframes hq-bob { 0%, 100% { transform: translateY(0) rotate(0deg); } 50% { transform: translateY(-3px) rotate(-3deg); } }
+@keyframes hq-jump { 0%, 100% { transform: translateY(0) scale(1); } 40% { transform: translateY(-8px) scale(1.06, .96); }
+  60% { transform: translateY(-6px) rotate(4deg); } }
+@keyframes hq-pulse { 0% { box-shadow: 0 0 0 0 rgba(82,224,168,.6); } 70% { box-shadow: 0 0 0 7px rgba(82,224,168,0); }
+  100% { box-shadow: 0 0 0 0 rgba(82,224,168,0); } }
 </style>
 """
 
 
 # ---------------------------------------------------------------------------
-# Session state
+# Session
 # ---------------------------------------------------------------------------
 
-def init_session_state() -> None:
-    defaults = {
-        "df": None,
-        "file_name": None,
-        "result": None,
-        "last_chart_dir": None,
-        "history": [],  # list of {"question": str, "answer": str}, oldest first
-        "load_error": None,
-        "uploader_key": 0,
-        "question_input": "",
-    }
-    for key, value in defaults.items():
-        if key not in st.session_state:
-            st.session_state[key] = value
+def init_session() -> None:
+    if "thread_id" not in st.session_state:
+        st.session_state["thread_id"] = st.query_params.get("chat") or uuid.uuid4().hex[:12]
+    st.session_state.setdefault("role", "customer")
+    st.query_params["chat"] = st.session_state["thread_id"]
 
 
-def clear_overview() -> None:
-    """Drop the full pipeline result and its temp chart files."""
-    if st.session_state.get("last_chart_dir"):
-        shutil.rmtree(st.session_state["last_chart_dir"], ignore_errors=True)
-    st.session_state["result"] = None
-    st.session_state["last_chart_dir"] = None
+def new_chat() -> None:
+    st.session_state["thread_id"] = uuid.uuid4().hex[:12]
+    st.query_params["chat"] = st.session_state["thread_id"]
 
 
-def clear_results() -> None:
-    clear_overview()
-    st.session_state["history"] = []
+def open_chat(thread_id: str) -> None:
+    st.session_state["thread_id"] = thread_id
+    st.query_params["chat"] = thread_id
 
 
-def reset_session() -> None:
-    """Clear everything: uploaded data, results, and any temp chart files."""
-    clear_results()
-    st.session_state["df"] = None
-    st.session_state["file_name"] = None
-    st.session_state["load_error"] = None
-    st.session_state["question_input"] = ""
-    # A new key gives a fresh, empty uploader so the old file isn't re-loaded.
-    st.session_state["uploader_key"] += 1
-
-
-def _clean_column_names(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Strip stray whitespace/quote characters from column names.
-
-    Real-world CSVs often have headers like `"Game Length"` where a space
-    before the quote (`, "Game Length"`) means pandas keeps the space and
-    quote marks as literal characters in the column name. Every agent (the
-    LLM included) would then have to guess the exact messy literal string,
-    which is unreliable - cleaning it once here fixes it everywhere.
-    """
-    cleaned = [str(c).strip().strip('"').strip("'").strip() for c in df.columns]
-    if len(set(cleaned)) == len(cleaned):
-        df = df.copy()
-        df.columns = cleaned
-    return df
-
-
-def load_csv(source) -> pd.DataFrame:
-    """Read and validate a CSV (uploaded file or path). Raises ValueError on problems."""
-    try:
-        df = pd.read_csv(source)
-    except Exception as exc:  # noqa: BLE001
-        raise ValueError(f"Could not read this file as a CSV. Details: {exc}") from exc
-
-    if df.empty or df.shape[1] == 0:
-        raise ValueError("The uploaded CSV is empty.")
-
-    df = _clean_column_names(df)
-
-    return df
-
-
-def set_dataset(source, name: str) -> None:
-    """Load a new dataset into the session, discarding results from the previous one."""
-    try:
-        df = load_csv(source)
-    except ValueError as exc:
-        st.session_state["load_error"] = str(exc)
-        return
-    clear_results()
-    st.session_state["df"] = df
-    st.session_state["file_name"] = name
-    st.session_state["load_error"] = None
-
-
-def _on_upload() -> None:
-    uploaded_file = st.session_state.get(f"uploader_{st.session_state['uploader_key']}")
-    if uploaded_file is not None:
-        set_dataset(uploaded_file, uploaded_file.name)
-
-
-def _clear_question() -> None:
-    st.session_state["question_input"] = ""
-
-
-def _on_suggestion() -> None:
-    choice = st.session_state.get("suggestion")
-    if choice:
-        st.session_state["question_input"] = choice
-    st.session_state["suggestion"] = None
+def staff_pin() -> str | None:
+    return os.getenv("STAFF_PIN") or None
 
 
 # ---------------------------------------------------------------------------
@@ -267,434 +184,388 @@ def _on_suggestion() -> None:
 def render_sidebar() -> None:
     with st.sidebar:
         st.markdown(
-            f"""
-            <div class="brand">
-                <div class="brand-logo">DA</div>
-                <div>
-                    <div class="brand-name">{APP_NAME}</div>
-                    <div class="brand-tag">{APP_TAGLINE}</div>
-                </div>
-            </div>
-            """,
+            f'<div class="brand"><img src="{AVATAR_DATA_URI}" alt=""><div>'
+            '<div class="brand-name">Helper Quote</div>'
+            '<div class="brand-tag"><span class="live-dot"></span>Helper is live</div>'
+            "</div></div>",
             unsafe_allow_html=True,
         )
+        st.button("New chat", icon=":material/add_comment:", width="stretch", type="primary", on_click=new_chat)
 
-        st.markdown('<div class="side-label">Data source</div>', unsafe_allow_html=True)
-        mode = st.segmented_control(
-            "Data source",
-            ["Upload", "Sample"],
-            default="Upload",
-            label_visibility="collapsed",
-            width="stretch",
-        )
-
-        if mode == "Sample":
-            samples = sorted(p.name for p in DATA_DIR.glob("*.csv"))
-            if samples:
-                sample = st.selectbox("Sample dataset", samples, label_visibility="collapsed")
-                if st.button("Load sample", icon=":material/download:", width="stretch"):
-                    set_dataset(DATA_DIR / sample, sample)
-            else:
-                st.caption("No sample CSVs found in the data/ folder.")
-        else:
-            st.file_uploader(
-                "Upload CSV",
-                type=["csv"],
-                key=f"uploader_{st.session_state['uploader_key']}",
-                on_change=_on_upload,
-                label_visibility="collapsed",
+        st.markdown('<div class="side-label">Conversations</div>', unsafe_allow_html=True)
+        threads = memory.list_threads()
+        if not threads:
+            st.caption("No conversations yet.")
+        for t in threads:
+            current = t["thread_id"] == st.session_state["thread_id"]
+            st.button(
+                thread_label(t),
+                key=f"thread_{t['thread_id']}",
+                width="stretch",
+                type="primary" if current else "secondary",
+                on_click=open_chat,
+                args=(t["thread_id"],),
             )
 
-        if st.session_state["load_error"]:
-            st.error(st.session_state["load_error"], icon=":material/error:")
+        st.markdown('<div class="side-label">Mode</div>', unsafe_allow_html=True)
+        render_mode_switch()
 
-        st.markdown('<div class="side-label">Engine</div>', unsafe_allow_html=True)
+        st.markdown('<div class="side-label">Price sheets (live)</div>', unsafe_allow_html=True)
+        pills = []
+        for wb in get_workbooks().list_workbooks():
+            ok = "error" not in wb
+            detail = f"updated {wb['last_updated'].replace('T', ' ')}" if ok else "error"
+            pills.append(f'<div class="status-pill"><span class="led {"ok" if ok else "bad"}"></span>'
+                         f'<span class="k">{wb["brand"]}</span><span>{detail}</span></div>')
         key_ok = agents.is_api_key_configured()
-        st.markdown(
-            f"""
-            <div class="status-pill"><span class="led {'ok' if key_ok else 'bad'}"></span>
-                <span class="k">Groq API</span><span>{'Connected' if key_ok else 'Key missing'}</span></div>
-            <div class="status-pill"><span class="led ok"></span>
-                <span class="k">Model</span><span>{agents.GROQ_MODEL_NAME}</span></div>
-            <div class="status-pill"><span class="led {'ok' if st.session_state['df'] is not None else 'bad'}"></span>
-                <span class="k">Dataset</span><span>{'Loaded' if st.session_state['df'] is not None else 'None'}</span></div>
-            """,
-            unsafe_allow_html=True,
-        )
-        if not key_ok:
-            st.caption("Add GROQ_API_KEY to a .env file (see .env.example), then restart the app.")
+        pills.append(f'<div class="status-pill"><span class="led {"ok" if key_ok else "bad"}"></span>'
+                     f'<span class="k">AI</span><span>{agents.model_name("agent").replace(":", " · ", 1) if key_ok else "Key missing"}</span></div>')
+        st.markdown("".join(pills), unsafe_allow_html=True)
+        missing = agents.missing_models()
+        if missing:
+            st.warning("Not available on this Groq account: " + ", ".join(missing)
+                       + ". Update models in config/settings.json.", icon=":material/warning:")
 
-        st.markdown('<div class="side-label">Session</div>', unsafe_allow_html=True)
-        if st.button("Reset session", icon=":material/restart_alt:", width="stretch"):
-            reset_session()
+        if st.session_state["role"] == "staff":
+            render_handoffs()
+            render_learned_rules()
+
+        st.caption("LangGraph · LangChain · Groq + OpenRouter · Streamlit")
+
+
+def thread_label(t: dict) -> str:
+    title = t.get("title") or "New conversation"
+    status = t.get("status") or ""
+    if status == "Needs you":
+        return f"{title}  :red[● Needs you]"
+    if status.startswith("Quote"):
+        return f"{title}  :green[● {status}]"
+    return title
+
+
+def render_handoffs() -> None:
+    handoffs = memory.open_handoffs()
+    st.markdown(f'<div class="side-label">Needs you ({len(handoffs)})</div>', unsafe_allow_html=True)
+    if not handoffs:
+        st.caption("No chats waiting for a designer.")
+    for h in handoffs:
+        with st.container(border=True):
+            st.markdown(f"**{':red[URGENT] ' if h['urgency'] == 'urgent' else ''}{h['reason']}**")
+            st.caption(h["summary"])
+            c1, c2 = st.columns(2)
+            c1.button("Open", key=f"ho_open_{h['thread_id']}", width="stretch",
+                      on_click=open_chat, args=(h["thread_id"],))
+            if c2.button("Resolved", key=f"ho_done_{h['thread_id']}", width="stretch"):
+                memory.resolve_handoff(h["thread_id"])
+                st.rerun()
+
+
+def render_mode_switch() -> None:
+    pin = staff_pin()
+    if st.session_state["role"] == "staff":
+        st.success("Staff mode - you can teach rules", icon=":material/badge:")
+        if st.button("Switch to customer mode", width="stretch"):
+            st.session_state["role"] = "customer"
+            st.rerun()
+        return
+    if not pin:
+        st.caption("Customer mode. Set STAFF_PIN in .env to enable staff mode (teach rules, look up customers).")
+        return
+    with st.popover("Staff login", icon=":material/lock:", width="stretch"):
+        entered = st.text_input("Staff PIN", type="password")
+        if st.button("Enter staff mode", width="stretch"):
+            if entered == pin:
+                st.session_state["role"] = "staff"
+                st.rerun()
+            else:
+                st.error("Wrong PIN")
+
+
+def render_learned_rules() -> None:
+    st.markdown('<div class="side-label">Rules taught in chat</div>', unsafe_allow_html=True)
+    rules = memory.learned_rules()
+    if not rules:
+        st.caption('None yet. Teach one in chat: "Remember: espresso goes to JSI".')
+    for r in rules:
+        c1, c2 = st.columns([5, 1])
+        c1.caption(r["rule"])
+        if c2.button("", key=f"del_{r['id']}", icon=":material/delete:", help="Forget this rule"):
+            memory.delete_learned_rule(r["id"])
             st.rerun()
 
-        st.caption("Built with LangChain · LangGraph · Groq · Streamlit")
-
 
 # ---------------------------------------------------------------------------
-# Main page sections
+# Chat rendering
 # ---------------------------------------------------------------------------
 
-def section_title(title: str, subtitle: str | None = None) -> None:
-    html = f'<div class="section-title">{title}</div>'
-    if subtitle:
-        html += f'<div class="section-sub">{subtitle}</div>'
-    st.markdown(html, unsafe_allow_html=True)
+def group_turns(messages):
+    """Split the message list into (user_message, [assistant-side messages]) turns."""
+    turns, current = [], None
+    for m in messages:
+        if isinstance(m, HumanMessage):
+            current = (m, [])
+            turns.append(current)
+        elif current is not None:
+            current[1].append(m)
+    return turns
 
 
-def render_header() -> None:
-    st.markdown(
-        f"""
-        <div class="hero">
-            <div class="hero-eyebrow">{APP_TAGLINE}</div>
-            <div class="hero-title">{APP_NAME.rsplit(" ", 1)[0]} <span>{APP_NAME.rsplit(" ", 1)[1]}</span></div>
-            <p class="hero-sub">
-                Upload a CSV and ask a question in plain English. A team of AI agents plans the
-                analysis, computes statistics, builds charts, and writes insights and a final
-                report for you.
-            </p>
-            <div class="hero-tags">
-                <span class="hero-tag">Multi-agent pipeline</span>
-                <span class="hero-tag">Parallel execution</span>
-                <span class="hero-tag">Exact statistics</span>
-                <span class="hero-tag">Downloadable report</span>
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+@st.cache_data(show_spinner=False, max_entries=200)
+def quote_pdf(quote_number: str) -> bytes:
+    """Quotes never change once created, so each PDF is built once."""
+    return render_quote_pdf(memory.get_quote(quote_number))
 
 
-def render_pipeline(done: bool) -> None:
-    def node(key: str) -> str:
-        cls = "pipe-node done" if done else "pipe-node"
-        return f'<div class="{cls}"><span class="dot"></span>{PIPELINE_STEPS[key][0]}</div>'
-
-    arrow = '<span class="pipe-arrow">&rarr;</span>'
-    st.markdown(
-        f"""
-        <div class="pipeline">
-            {node("planner")}{arrow}
-            <div class="pipe-col">{node("statistics")}{node("visualization")}</div>{arrow}
-            {node("insight")}{arrow}{node("report")}
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-def render_empty_state() -> None:
-    cols = st.columns(3)
-    features = [
-        ("Step 1", "Load your data", "Upload a CSV from the sidebar, or pick one of the bundled sample datasets."),
-        ("Step 2", "Ask a question", "Type anything in plain English - revenue, trends, top items, missing values."),
-        ("Step 3", "Get the analysis", "Receive an answer, statistics, charts, AI insights and a downloadable report."),
-    ]
-    for col, (step, title, text) in zip(cols, features):
-        col.markdown(
-            f"""
-            <div class="feature">
-                <div class="feature-step">{step}</div>
-                <div class="feature-title">{title}</div>
-                <p class="feature-text">{text}</p>
-            </div>
-            """,
+def render_quote_card(quote_number: str) -> None:
+    q = memory.get_quote(quote_number)
+    if not q:
+        return
+    t = q["totals"]
+    with st.container(key=f"quote_{q['quote_number']}_{uuid.uuid4().hex[:6]}"):
+        st.markdown(
+            f'<div class="quote-head"><div><div class="quote-no">Quote {q["quote_number"]}<span class="quote-badge">Ready</span></div>'
+            f'<div class="quote-meta">{q["customer"]["name"]} · {q["brand_display"]} · <b>{q["line"]}</b> · '
+            f'valid until {q["valid_until"]}</div></div>'
+            f'<div class="quote-total">${t["grand_total"]:,.2f}</div></div>',
             unsafe_allow_html=True,
         )
-
-    st.write("")
-    with st.container(border=True):
-        section_title("How the workflow runs", "Statistics and Visualization agents run in parallel; Insights waits for both.")
-        render_pipeline(done=False)
-
-
-def column_profile(df: pd.DataFrame) -> pd.DataFrame:
-    return pd.DataFrame(
-        {
-            "Column": df.columns,
-            "Type": [str(t) for t in df.dtypes],
-            "Non-null": df.notna().sum().values,
-            "Missing": df.isna().sum().values,
-            "Missing %": (df.isna().mean() * 100).round(1).values,
-            "Unique": df.nunique().values,
-        }
-    )
-
-
-def render_data_overview() -> None:
-    df: pd.DataFrame = st.session_state["df"]
-
-    section_title("Dataset overview", f"Source: <b>{st.session_state['file_name']}</b>")
-
-    total_cells = df.shape[0] * df.shape[1]
-    missing_cells = int(df.isna().sum().sum())
-    missing_pct = (missing_cells / total_cells * 100) if total_cells else 0.0
-
-    m1, m2, m3, m4, m5 = st.columns(5)
-    m1.metric("Rows", f"{df.shape[0]:,}")
-    m2.metric("Columns", f"{df.shape[1]:,}")
-    m3.metric("Numeric columns", f"{df.select_dtypes('number').shape[1]:,}")
-    m4.metric("Missing cells", f"{missing_pct:.1f}%")
-    m5.metric("Duplicate rows", f"{int(df.duplicated().sum()):,}")
-
-    preview_tab, profile_tab, summary_tab = st.tabs(
-        [":material/table_view: Preview", ":material/view_column: Column profile", ":material/functions: Summary statistics"]
-    )
-    with preview_tab:
-        st.dataframe(df.head(100), width="stretch", height=320)
-        st.caption(f"Showing first {min(100, df.shape[0])} of {df.shape[0]:,} rows.")
-    with profile_tab:
+        rows = [{"Item #": i["sku"], "Description": i["description"], "Qty": i["quantity"],
+                 "Unit price": i["unit_price"], "Total": i["total"]} for i in q["items"]]
         st.dataframe(
-            column_profile(df),
-            width="stretch",
-            hide_index=True,
+            rows, hide_index=True, width="stretch",
             column_config={
-                "Missing %": st.column_config.ProgressColumn(
-                    "Missing %", min_value=0, max_value=100, format="%.1f%%"
-                ),
+                "Unit price": st.column_config.NumberColumn(format="$%.2f"),
+                "Total": st.column_config.NumberColumn(format="$%.2f"),
             },
         )
-    with summary_tab:
-        numeric = df.select_dtypes("number")
-        if numeric.empty:
-            st.info("This dataset has no numeric columns.")
-        else:
-            st.dataframe(numeric.describe().T.round(3), width="stretch")
-
-
-def render_question_form() -> tuple[str | None, str]:
-    """Returns (action, question) where action is "analyze", "regenerate" or None."""
-    with st.container(border=True):
-        section_title("Ask the agents", "Ask anything about your data in plain English.")
-
-        st.pills(
-            "Suggestions",
-            EXAMPLE_QUESTIONS,
-            selection_mode="single",
-            key="suggestion",
-            on_change=_on_suggestion,
-            label_visibility="collapsed",
-        )
-
-        question = st.text_area(
-            "Your question",
-            key="question_input",
-            placeholder="e.g. Which product generated the highest revenue?",
-            height=96,
-            label_visibility="collapsed",
-        )
-
-        has_result = st.session_state.get("result") is not None
-        col1, col2, col3 = st.columns([2, 2, 1])
-        analyze = col1.button(
-            "Analyze",
-            type="primary",
-            icon=":material/play_arrow:",
-            width="stretch",
-        )
-        regenerate = col2.button(
-            "Regenerate full overview",
-            icon=":material/refresh:",
-            width="stretch",
-            help="Re-run the full multi-agent pipeline (statistics, charts, insights, report) for this question.",
-        )
-        col3.button("Clear", icon=":material/backspace:", width="stretch", on_click=_clear_question)
-
-        if has_result:
-            st.caption(
-                "The overview (statistics, charts, insights, report) was generated from your first question. "
-                "New questions update the Answer tab only - use *Regenerate* to rebuild the overview."
-            )
-
-    if analyze:
-        return "analyze", question
-    if regenerate:
-        return "regenerate", question
-    return None, question
-
-
-def run_workflow(question: str, full: bool) -> None:
-    """Answer the question, and (if `full`) run the whole LangGraph pipeline with live progress."""
-    df = st.session_state["df"]
-    started = time.perf_counter()
-
-    with st.status("Running agentic workflow...", expanded=True) as status:
-        try:
-            st.write(":material/forum: **Query agent** - answering your question")
-            answer = agents.run_query_agent(question, df)
-            st.session_state["history"].append({"question": question, "answer": answer})
-
-            if full:
-                clear_overview()
-                final_state = None
-                for node_name, state in stream_analysis(df, question):
-                    st.session_state["last_chart_dir"] = state.get("chart_dir")
-                    label, desc = PIPELINE_STEPS.get(node_name, (node_name.title(), "finished"))
-                    st.write(f":material/check_circle: **{label}** - {desc}")
-                    final_state = state
-                st.session_state["result"] = final_state
-
-            elapsed = time.perf_counter() - started
-            status.update(label=f"Workflow complete in {elapsed:.1f}s", state="complete", expanded=False)
-        except Exception as exc:  # noqa: BLE001
-            status.update(label="Workflow failed", state="error", expanded=True)
-            st.error(f"Analysis failed: {exc}", icon=":material/error:")
-
-
-def render_results() -> None:
-    history = st.session_state["history"]
-    result = st.session_state["result"]
-
-    if not history and not result:
-        return
-
-    st.write("")
-    section_title("Results")
-
-    if result:
-        render_pipeline(done=True)
-        if result.get("error"):
-            st.warning(f"Part of the pipeline had an issue: {result['error']}", icon=":material/warning:")
-
-    answer_tab, stats_tab, charts_tab, insights_tab, report_tab = st.tabs(
-        [
-            ":material/forum: Answer",
-            ":material/bar_chart: Statistics",
-            ":material/monitoring: Charts",
-            ":material/lightbulb: AI Insights",
-            ":material/description: Final Report",
-        ]
-    )
-
-    with answer_tab:
-        if not history:
-            st.info("Ask a question to see an answer here.")
-        else:
-            latest = history[-1]
-            with st.container(border=True):
-                st.markdown(f'<div class="answer-q">{_escape(latest["question"])}</div>', unsafe_allow_html=True)
-                st.markdown(latest["answer"])
-            if len(history) > 1:
-                with st.expander(f"Earlier questions ({len(history) - 1})", icon=":material/history:"):
-                    for item in reversed(history[:-1]):
-                        st.markdown(f"**{item['question']}**")
-                        st.markdown(item["answer"])
-                        st.divider()
-
-    if not result:
-        for tab in (stats_tab, charts_tab, insights_tab, report_tab):
-            with tab:
-                st.info("Run the full analysis to generate this section.")
-        return
-
-    with stats_tab:
-        render_statistics(result.get("statistics") or {})
-
-    with charts_tab:
-        charts = result.get("charts") or []
-        if not charts:
-            st.info("No charts were needed to answer this question.")
-        cols = st.columns(2)
-        for i, chart in enumerate(charts):
-            with cols[i % 2].container(border=True):
-                st.markdown(f"**{chart['title']}**")
-                st.image(chart["path"], width="stretch")
-
-    with insights_tab:
-        with st.container(border=True):
-            st.markdown(result.get("insights") or "No insights generated.")
-
-    with report_tab:
-        report = result.get("report") or ""
+        lines = [f"Cabinets & accessories: **\\${t['subtotal']:,.2f}**"]
+        if q["assembled"]:
+            lines.append(f"Assembly ({q['assembly_fee_percent']:g}%): **\\${t['assembly_fee']:,.2f}**")
+        for x in q["extras"]:
+            lines.append(money_safe(f"{x['label']}: **${x['amount']:,.2f}** — {x['detail']}"))
+        lines.append("Shipping: quoted separately by the office" if q["shipping"] else "Pickup / no shipping")
+        st.markdown("  \n".join(lines))
+        if q.get("unpriced_items"):
+            st.warning("To be confirmed by a designer: " + ", ".join(q["unpriced_items"]), icon=":material/info:")
         st.download_button(
-            "Download report (Markdown)",
-            data=report,
-            file_name="data_analysis_report.md",
-            mime="text/markdown",
-            icon=":material/download:",
+            "Download quote (PDF)",
+            data=quote_pdf(q["quote_number"]),
+            file_name=f"{q['quote_number']}.pdf",
+            mime="application/pdf",
+            icon=":material/picture_as_pdf:",
             type="primary",
-            disabled=not report,
+            key=f"pdf_{q['quote_number']}_{uuid.uuid4().hex[:6]}",
         )
-        with st.container(border=True):
-            st.markdown(report or "No report generated.")
 
 
-def render_statistics(stats: dict) -> None:
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Rows", stats.get("row_count", "-"))
-    c2.metric("Columns", stats.get("column_count", "-"))
-    missing = stats.get("missing_values") or {}
-    c3.metric("Columns with missing values", len(missing))
+def render_assistant_turn(parts) -> None:
+    thinking, steps, quotes, answer = [], [], [], ""
+    questions, clarifications = {}, []
+    for m in parts:
+        if isinstance(m, AIMessage):
+            reasoning = m.additional_kwargs.get("reasoning_content")
+            if reasoning:
+                thinking.append(reasoning)
+            for tc in m.tool_calls:
+                steps.append(TOOL_LABELS.get(tc["name"], tc["name"]))
+                if tc["name"] == "ask_customer":
+                    questions[tc["id"]] = tc["args"].get("question", "")
+            if m.content and not m.tool_calls:
+                answer = m.content
+        elif isinstance(m, ToolMessage) and m.name == "ask_customer" and m.tool_call_id in questions:
+            try:
+                chosen = json.loads(m.content).get("customer_answer")
+            except (TypeError, ValueError):
+                chosen = m.content
+            clarifications.append((questions[m.tool_call_id], chosen))
+        elif isinstance(m, ToolMessage) and m.name == "create_quote":
+            try:
+                data = json.loads(m.content)
+            except (TypeError, ValueError):
+                continue
+            if data.get("status") == "created":
+                quotes.append(data["quote_number"])
 
-    left, right = st.columns(2)
-    with left:
-        st.markdown("**Missing values**")
-        if missing:
-            st.dataframe(
-                pd.DataFrame(list(missing.items()), columns=["Column", "Missing"]),
-                width="stretch",
-                hide_index=True,
-            )
-        else:
-            st.success("No missing values.", icon=":material/check_circle:")
-    with right:
-        unique_counts = stats.get("categorical_unique_counts") or {}
-        if unique_counts:
-            st.markdown("**Distinct values per categorical column**")
-            st.dataframe(
-                pd.DataFrame(list(unique_counts.items()), columns=["Column", "Distinct values"]),
-                width="stretch",
-                hide_index=True,
-            )
-
-    numeric_summary = stats.get("numeric_summary") or {}
-    if numeric_summary:
-        st.markdown("**Numeric summary**")
-        st.dataframe(pd.DataFrame(numeric_summary).T, width="stretch")
-
-    grouped = stats.get("grouped_summary")
-    if grouped:
-        st.markdown(f"**Grouped by {grouped['groupby_column']} ({grouped['metric_column']})**")
-        st.dataframe(pd.DataFrame(grouped["data"]).T, width="stretch")
+    if thinking or steps:
+        with st.expander("Thinking & steps", icon=":material/psychology:"):
+            for s in steps:
+                st.markdown(f":material/check_circle: {s}")
+            for text in thinking:
+                st.caption(text)
+    for question, chosen in clarifications:
+        bubble(question)
+        picked = ", ".join(chosen) if isinstance(chosen, list) else str(chosen)
+        st.markdown(f'<span class="chosen">↳ {html_escape(picked)}</span>', unsafe_allow_html=True)
+    if answer:
+        bubble(answer)
+    for number in quotes:
+        render_quote_card(number)
 
 
-def _escape(text: str) -> str:
+def bubble(text: str, who: str = "a") -> None:
+    """A chat bubble: dark plum for the agent ('a'), soft sand for the user ('u')."""
+    with st.container(key=f"{who}msg_{uuid.uuid4().hex[:8]}"):
+        st.markdown(money_safe(text))
+
+
+def money_safe(text: str) -> str:
+    """Streamlit treats $...$ as LaTeX math - escape dollar signs so prices render as text."""
+    return str(text).replace("\\$", "$").replace("$", "\\$")
+
+
+def html_escape(text: str) -> str:
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+def render_pending_question(pending) -> str | list | None:
+    """The agent paused (LangGraph interrupt) to ask the customer: show clickable options."""
+    ask = pending.value or {}
+    options = ask.get("options") or []
+    key = f"ask_{getattr(pending, 'id', '')}"
+    with st.chat_message("assistant", avatar=AVATAR):
+        bubble(ask.get("question", "Could you clarify?"))
+        if not options:
+            st.caption("Type your answer below.")
+            return None
+        if ask.get("allow_multiple"):
+            picked = st.pills("Options", options, selection_mode="multi", key=key, label_visibility="collapsed")
+            if st.button("Send", icon=":material/send:", key=f"{key}_send", disabled=not picked):
+                return picked
+            st.caption("Pick one or more, or type a different answer below.")
+            return None
+        picked = st.pills("Options", options, key=key, label_visibility="collapsed")
+        st.caption("Pick one, or type a different answer below.")
+        return picked
+
+
+def render_history(messages) -> None:
+    for human, parts in group_turns(messages):
+        with st.chat_message("user"):
+            bubble(human.content, "u")
+        if parts:
+            with st.chat_message("assistant", avatar=AVATAR):
+                render_assistant_turn(parts)
+
+
+def render_suggestions(messages) -> str | None:
+    """Clickable next steps the understanding step composed for its last reply."""
+    last = messages[-1]
+    suggestions = last.additional_kwargs.get("suggestions") if isinstance(last, AIMessage) else None
+    if not suggestions:
+        return None
+    return st.pills("Next steps", suggestions, label_visibility="collapsed", key=f"next_{last.id}")
+
+
+def render_welcome() -> str | None:
+    with st.chat_message("assistant", avatar=AVATAR):
+        bubble(
+            "Hi! I'm **Helper Quote**. Send me your cabinet list (item codes and quantities) and the "
+            "color you want, and I'll put together a quote right away. I can also estimate countertops, "
+            "handles and installation."
+        )
+    return st.pills("Try", SUGGESTIONS, label_visibility="collapsed", key=f"sugg_{st.session_state['thread_id']}")
+
+
+def run_turn(text, resume: bool = False) -> None:
+    """Send a new message, or (resume=True) answer the agent's pending question."""
+    graph = get_graph()
+    config = run_config(st.session_state["thread_id"], st.session_state["role"])
+    shown = ", ".join(text) if isinstance(text, list) else str(text)
+    thread = memory.get_thread(st.session_state["thread_id"])
+    memory.update_thread(st.session_state["thread_id"], title=thread.get("title") or shown[:60])
+    graph_input = Command(resume=text) if resume else {"messages": [HumanMessage(shown)]}
+
+    with st.chat_message("user"):
+        bubble(shown, "u")
+    with st.chat_message("assistant", avatar=AVATAR):
+        started = time.perf_counter()
+        st.container(key="thinking_now").empty()
+        with st.status("Thinking...", expanded=False) as status:
+            try:
+                for mode, chunk in graph.stream(graph_input, config,
+                                                stream_mode=["updates", "custom"]):
+                    if mode == "custom" and "waiting_seconds" in (chunk or {}):
+                        status.update(label=f"Waiting {chunk['waiting_seconds']}s for the Groq rate limit...")
+                        continue
+                    for node, output in (chunk or {}).items():
+                        if node == "agent":
+                            for m in (output or {}).get("messages", []):
+                                for tc in getattr(m, "tool_calls", []) or []:
+                                    status.update(label=TOOL_LABELS.get(tc["name"], tc["name"]) + "...")
+                                    st.write(f":material/check_circle: {TOOL_LABELS.get(tc['name'], tc['name'])}")
+                        elif node == "understand":
+                            status.update(label="Understanding your message...")
+                        elif node == "remember":
+                            status.update(label="Saving to memory...")
+                status.update(label=f"Done in {time.perf_counter() - started:.1f}s", state="complete")
+            except AllModelsBusy as exc:
+                status.update(label="Usage limit reached", state="error", expanded=False)
+                minutes = max(1, round(exc.retry_after / 60))
+                bubble(f"I've reached today's AI usage limit, so I can't finish this right now. "
+                       f"Please try again in about **{minutes} minute{'s' if minutes != 1 else ''}** - "
+                       "everything you told me is saved, so we can pick up right where we left off.")
+                if st.session_state["role"] == "staff":
+                    st.caption("Staff: Groq daily token limit reached on all configured models. "
+                               "Upgrade to Groq Dev tier or add fallback models in config/settings.json.")
+                return
+            except Exception as exc:  # noqa: BLE001
+                status.update(label="Something went wrong", state="error", expanded=False)
+                bubble("Sorry, something went wrong on my side while working on that. "
+                       "Please send your message again - nothing you told me was lost.")
+                if st.session_state["role"] == "staff":
+                    st.caption(f"Staff detail: {type(exc).__name__}: {str(exc)[:300]}")
+                return
+    st.rerun()
+
+
 # ---------------------------------------------------------------------------
-# App entry point
+# App
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    init_session_state()
+    init_session()
     st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
     render_sidebar()
-    render_header()
 
-    if st.session_state["df"] is None:
-        render_empty_state()
+    st.markdown(
+        f'<div class="topbar"><div><div class="eyebrow">{date.today().strftime("%A %d %B")}</div>'
+        '<div class="title">Helper Quote</div></div>'
+        '<div class="live"><div class="live-pill"><span class="live-dot"></span>HELPER ON</div>'
+        f'<div class="live-face"><img src="{AVATAR_DATA_URI}" alt=""></div></div></div>',
+        unsafe_allow_html=True,
+    )
+
+    if not agents.is_api_key_configured():
+        st.error("GROQ_API_KEY is not set. Add it to a .env file, then restart the app.", icon=":material/key:")
         return
 
-    render_data_overview()
-    st.write("")
-    action, question = render_question_form()
+    state = get_graph().get_state(run_config(st.session_state["thread_id"]))
+    messages = state.values.get("messages", []) if state and state.values else []
 
-    if action is not None:
-        clean_question = question.strip()
-        if not clean_question and action == "regenerate" and st.session_state["history"]:
-            clean_question = st.session_state["history"][-1]["question"]
+    pending = state.interrupts[0] if state and state.interrupts else None
 
-        if not clean_question:
-            st.warning("Please type a question first.", icon=":material/edit:")
-        elif not agents.is_api_key_configured():
-            st.error("GROQ_API_KEY is not set. Add it to a .env file, then restart the app.", icon=":material/key:")
-        else:
-            full = action == "regenerate" or st.session_state["result"] is None
-            run_workflow(clean_question, full=full)
+    picked = None
+    if not messages:
+        picked = render_welcome()
+    else:
+        if state.values.get("summary"):
+            st.caption(":material/history: Earlier messages were summarized into memory.")
+        render_history(messages)
+    if pending is not None:
+        picked = render_pending_question(pending)
 
-    render_results()
+    max_chars = int(agents.load_settings().get("chat", {}).get("max_message_chars", 4000))
+    prompt = st.chat_input("Type your answer..." if pending else "Type your cabinet list, color, or a question...",
+                           max_chars=max_chars)
+    if prompt and not prompt.strip():
+        prompt = None
+    if prompt and len(prompt) > max_chars:  # defence in depth (pasted text, API clients)
+        prompt = prompt[:max_chars]
+    if not pending and picked is None and messages:
+        picked = render_suggestions(messages)
+    text = prompt or picked
+    if text:
+        run_turn(text, resume=pending is not None)
 
 
 if __name__ == "__main__":

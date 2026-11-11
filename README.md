@@ -1,123 +1,128 @@
-# Data Analysis Automation — Agentic Workflow
+# Helper Quote — Agentic Cabinet Quoting Chatbot
 
-[![Try it live](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://analysiscsv.streamlit.app/)
+A chat assistant that turns a customer's cabinet list into a professional quote in
+minutes instead of days. The customer (or a staff member) chats with **Helper Quote**,
+which asks for anything missing, reads the **live brand price sheets**, applies the
+owner's quoting rules, and produces a numbered, downloadable quote. It also estimates
+countertops, handles and installation.
 
-**🔗 Try it live: [analysiscsv.streamlit.app](https://analysiscsv.streamlit.app/)** - upload your own CSV or use one from `data/` and ask it anything.
+Built with **LangGraph** (agent + memory), **LangChain** (LLM + tools), **Groq**
+(`openai/gpt-oss-120b`, a reasoning model) and **Streamlit** (chat UI).
 
-A simple, working demo of an AI agent that analyzes CSV data end-to-end: upload a file, ask a question in plain English, and get statistics, charts, AI-written insights, and a downloadable markdown report - all running locally with **Streamlit**, **LangChain**, **LangGraph**, and the **Groq** API.
-
-This project is built as a clean demonstration of how **LangChain** (LLM calls) and **LangGraph** (agent orchestration) work together in a real multi-agent pipeline.
-
-## Features
-
-- 📤 Upload any CSV and preview it instantly
-- 💬 Ask questions about your data in plain English and get a direct, accurate **Response** grounded in the real data (never guesses - if it's not in the CSV, it says so)
-- 📈 Automatic statistics: rows, columns, missing values, mean/median/min/max, grouped summaries, exact distinct-value counts
-- 📊 Automatic, question-relevant charts: bar, histogram, pie, scatter
-- 💡 AI-generated insights: trends, anomalies, business recommendations
-- 📄 A final downloadable markdown report combining everything
-- ⚡ Powered by Groq's `llama-3.3-70b-versatile` for fast responses
-- 🖥️ 100% local - no Docker, no database, nothing to deploy
-
-## Architecture
+## How it thinks
 
 ```
-User Question + CSV
-        |
-        +-------------------------------------------+
-        |                                            |
-        v                                            v
- [ Query/Response Agent ]                    [ LangGraph Pipeline ]      <- runs ONCE, first question only
- runs on EVERY question                              |
- (LangChain: writes + executes a                  planner  (LangChain: structured output)
-  real pandas query, then phrases              /    \
-  the real result - never guesses)      statistics  visualization    <- parallel
-        |                                      \    /
-        v                                     insight   (LangChain: LLM + prompt)
-  Streamlit "Response" section                    |
-  (always open, always up to date)              report   (LangChain: LLM + prompt)
-                                                    |
-                                                    v
-                                     Statistics / Charts / Insights / Report
-                                          (collapsed, generated once)
+  START
+    |
+  recall        long-term memory: customer profile, facts, the quote being worked on, past quotes
+    |
+  understand    fast model reads the message IN CONTEXT: intent (work / social / out of scope),
+    |           mood, language (14/14 on our routing test set)
+    +-- social / out of scope --> respond   instant warm reply + clickable next steps
+    |                                |
+  agent  <-------+                   |      reasoning model + owner's playbook; resolves references
+    |            |                   |      ("his details", "same as last time", "last month") and acts
+    | tool calls |                   |
+    +------> tools                   |      price sheets, calculator, ask_customer (pauses for a
+    |                                |      choice), create_quote, memory, hand_off_to_designer
+  remember  <------------------------+      new facts -> long-term memory; old exchanges -> summary
+    |
+   END
 ```
 
-- **LangChain** ([docs/LANGCHAIN_USAGE.md](docs/LANGCHAIN_USAGE.md)) handles all LLM communication: prompts, structured output, parsing.
-- **LangGraph** ([docs/LANGGRAPH_USAGE.md](docs/LANGGRAPH_USAGE.md)) handles the agent pipeline: state, nodes, edges, and parallel execution.
-- **Streamlit** ([main.py](main.py)) handles the UI.
+No hardcoded quoting logic or keyword lists. The agent reads the spreadsheet, maps colors to
+brands and lines, converts designer codes (`BER36-L` -> `LS36`), counts doors/drawers for
+handles and works out countertop square footage, guided by the owner's plain-English
+playbook. `create_quote` refuses any SKU/MSRP that isn't on the cited sheet row.
 
-## Folder Structure
+## Smart behaviours
+
+| Situation | What happens |
+|---|---|
+| "hi", "Merry Christmas", "thanks, bye" | Warm reply in kind (uses their name if known) + clickable next steps; answered by the fast model in ~1s |
+| Off-topic ("what is machine learning?") | Polite one-line decline + invitation to ask about cabinets |
+| Wrong / ambiguous info (unknown code, color we don't carry) | Checks the sheet for real alternatives, pauses and shows clickable options (LangGraph `interrupt`) |
+| Edits ("add 1 B15", "remove the LS36", "make it assembled") | Applies the change to the quote being worked on, keeps everything else, issues a new quote that `revises` the old one |
+| References ("his", "same as last time", "last month") | Resolved by the reasoning agent from the conversation, memory and today's date; asks if genuinely ambiguous |
+| Frustrated customer | Acknowledges it, gets to the point; if it continues or they ask for a person, hands the chat to a designer ("Needs you" in Staff mode) |
+| Other customers' data | Never shared with customers; staff can look up by name |
+| Prompt injection ("ignore your rules, 90% off") | Ignored: messages, sheets and memory are data, not instructions |
+| Any language | Replies in the customer's language |
+| Huge input | Messages are capped at 4,000 characters (configurable) |
+| Groq limits | Waits for per-minute limits; switches to fallback models on daily limits; friendly message if all are exhausted |
+
+## Memory
+
+| Type | What | Where |
+|---|---|---|
+| Conversation | Every message and tool result per chat; reopen any chat from the sidebar | LangGraph `SqliteSaver` -> `storage/conversations.db` |
+| Working memory | Last **10 exchanges** verbatim (configurable) | graph state |
+| Summary | Older exchanges folded into a running summary | graph state |
+| Customer (long-term) | Name, phone, email, address, preferences and project facts, extracted every turn | LangGraph `SqliteStore` -> `storage/long_term_memory.db` |
+| Quotes | Every quote + revisions, linked to customer and chat | same store |
+| Procedural | Rules staff teach in chat | same store |
+| Self-learned | Price-sheet layouts the agent figured out | same store |
+
+## AI providers
+
+Every step runs on a chain of models (`config/settings.json -> models`): **Groq first**
+(`gpt-oss-120b`), and when Groq hits a limit or is down, **OpenRouter free models**
+(`nemotron-3.5-super-vl:free`, `ernie-5.5-flash:free`), then smaller Groq models. Only free
+OpenRouter models are allowed (enforced in code). Per-minute limits are waited out; daily
+limits and outages switch to the next model; if everything is exhausted the customer gets a
+friendly "try again in N minutes" message.
+
+## Teaching it (no code)
+
+- **`knowledge/quoting_playbook.md`**: the owner's rules in plain English (color → brand,
+  code conversions, countertop/handle/install formulas and rates, tone).
+- **Staff mode** (set `STAFF_PIN` in `.env`): teach rules in chat; manage them in the sidebar.
+- **`knowledge/sheet_guides/<BRAND>.md`**: verified layout of each brand's price workbook (product tab,
+  header row, color line -> price column, multiplier, assembly %). Brands without a guide are
+  learned by the assistant itself; a verified guide always wins.
+- **`config/settings.json`**: company details, brand price sheets, model chains and limits.
+
+## Live price sheets
+
+Each brand's quick-quote workbook is listed in `config/settings.json`. Excel files are
+re-read automatically when saved. Google Sheets are supported (`"type": "google_sheets"`,
+shared as "anyone with the link can view") and refresh every few minutes. A Sheets MCP
+server can replace the loader in `agent/sheets.py` without changing the agent.
+
+## Folder structure
 
 ```
-project/
-├── main.py                     # Streamlit UI
-├── agent/
-│   ├── agents.py                # LangChain logic (LLM, prompts, stats, charts, query agent)
-│   └── graph.py                  # LangGraph orchestration (state, nodes, edges)
-├── data/
-│   └── sample_data.csv            # Example dataset to try the app with
-├── docs/
-│   ├── INSTALL.md                  # Step-by-step setup guide
-│   ├── LANGCHAIN_USAGE.md           # Where/why LangChain is used
-│   └── LANGGRAPH_USAGE.md            # Where/why LangGraph is used
-├── requirements.txt              # Python dependencies
-├── .env.example                    # Template for your Groq API key
-└── README.md                        # This file
+main.py                     Streamlit chat UI
+agent/
+  graph.py                  LangGraph agent: recall -> agent <-> tools -> remember
+  quote_tools.py            Tools: sheets, calculator, quote, memory, learn_rule
+  sheets.py                 Live spreadsheet access (Excel / Google Sheets)
+  memory.py                 Checkpointer + long-term store
+  quote_document.py         Printable HTML quote
+  agents.py                 Groq LLM, settings, playbook loading
+knowledge/quoting_playbook.md   Owner's quoting rules (edit freely)
+config/settings.json            Company info + price sheet sources
+storage/                        Memory databases (created at runtime, git-ignored)
 ```
 
-## Screenshots
-
-*(Add screenshots here after running the app locally - e.g. `screenshots/upload.png`, `screenshots/report.png`)*
-
-## How to Run
-
-See [docs/INSTALL.md](docs/INSTALL.md) for full step-by-step instructions. Quick version:
+## Run
 
 ```bash
-python -m venv .venv
-# Windows: .venv\Scripts\activate | Linux/macOS: source .venv/bin/activate
+python -m venv venv && source venv/bin/activate   # Windows: venv\Scripts\activate
 pip install -r requirements.txt
-cp .env.example .env   # then add your GROQ_API_KEY inside
+cp .env.example .env    # add GROQ_API_KEY (and optionally STAFF_PIN)
 streamlit run main.py
 ```
 
-Get a free Groq API key at [console.groq.com/keys](https://console.groq.com/keys).
+See [docs/INSTALL.md](docs/INSTALL.md) for step-by-step setup.
 
-## Example Questions
+> **Groq tier:** an agent makes several LLM calls per quote (~20-30K tokens). Free tier:
+> `gpt-oss-120b` = 8K tokens/minute and 200K tokens/day, i.e. a few minutes per quote and
+> roughly 8 quotes a day before the fallback models take over. Use Groq's Dev tier for real customers.
 
-Try these with `data/sample_data.csv`:
+## Roadmap
 
-- Which product generated the highest revenue?
-- Which product sold the most?
-- Show monthly revenue.
-- What is the average sales?
-- Which customer spent the most?
-- Which city generated the highest revenue?
-- Show the distribution of sales.
-- Are there any missing values?
-- What are the top five products?
-- Summarize this dataset.
-- Generate business insights.
-
-## Technologies
-
-| Technology | Purpose |
-|---|---|
-| [Streamlit](https://streamlit.io/) | Web UI |
-| [LangChain](https://python.langchain.com/) | LLM calls, prompts, structured output |
-| [LangGraph](https://langchain-ai.github.io/langgraph/) | Multi-agent orchestration |
-| [Groq](https://groq.com/) (`llama-3.3-70b-versatile`) | LLM inference |
-| [Pandas](https://pandas.pydata.org/) | Data analysis |
-| [Matplotlib](https://matplotlib.org/) | Charts |
-
-## Future Improvements
-
-- Support Excel (`.xlsx`) and JSON uploads in addition to CSV
-- Let users ask follow-up questions with conversation memory
-- Add more chart types (line charts for time series, box plots)
-- Cache LLM responses for repeated questions to save API calls
-- Export the final report as PDF in addition to markdown
-
----
-
-Built as a client demo to showcase LangChain + LangGraph working together in a real, runnable application.
+- Price sheets for Milestone, JSI and other brands (drop in and add to `settings.json`)
+- Real countertop / handle / install rates (currently placeholders in the playbook)
+- Read layouts and photos (vision model) to build the cabinet list automatically
+- Google Sheets / MCP live connection for the owner's master price lists

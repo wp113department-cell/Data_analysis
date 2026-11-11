@@ -1,0 +1,54 @@
+{
+  "assistant_name": "Helper Quote",
+  "company": {
+    "name": "US Cabinets",
+    "phone": "",
+    "email": "",
+    "address": "",
+    "quote_valid_days": 30,
+    "quote_number_prefix": "HQ-",
+    "quote_footer": "This is an estimate generated from our current price lists. Final pricing is confirmed by our team before ordering. Shipping, if requested, is quoted separately by the office."
+  },
+  "price_sheets": {
+    "HCC": {
+      "display_name": "Heritage Craft Cabinetry - Signature Series",
+      "type": "excel",
+      "path": "Copy of HCC Signature Series Quote.xlsm"
+    }
+  },
+  "models": {
+    "agent": [
+      "groq:openai/gpt-oss-120b",
+      "openrouter:nvidia/nemotron-3.5-super-vl:free",
+      "openrouter:baidu/ernie-5.5-flash-preview:free",
+      "groq:openai/gpt-oss-20b",
+      "openrouter:openrouter/free"
+    ],
+    "router": [
+      "groq:openai/gpt-oss-20b",
+      "openrouter:baidu/ernie-5.5-flash-preview:free",
+      "openrouter:openrouter/free"
+    ],
+    "memory": [
+      "groq:qwen/qwen3.8-27b",
+      "openrouter:baidu/ernie-5.5-flash-preview:free",
+      "openrouter:openrouter/free"
+    ],
+    "agent_max_output_tokens": 2048,
+    "agent_reasoning_effort": "low",
+    "allow_paid_openrouter_models": false,
+    "_help": "Each role is a chain 'provider:model' - first is preferred, the rest are used automatically when a model hits a limit, isn't available, or its provider is down. Providers: groq (GROQ_API_KEY), openrouter (OPENROUTER_API_KEY). Only free OpenRouter models (':free' or 'openrouter/free') are used unless allow_paid_openrouter_models is true. For testing you can override a chain in .env, e.g. HQ_MODEL_AGENT=openrouter:openrouter/free,groq:openai/gpt-oss-120b"
+  },
+  "rate_limits": {
+    "groq:openai/gpt-oss-120b": 8000,
+    "groq:openai/gpt-oss-20b": 8000,
+    "groq:qwen/qwen3.8-27b": 8000
+  },
+  "_rate_limits_help": "Tokens-per-minute limit per model, read from Groq's x-ratelimit headers for this account (Groq free tier: 8,000/min, 1,000 requests/day; gpt-oss also 200,000 tokens/day). OpenRouter free models: ~20 requests/min and 50/day on a key without credits. The app waits for per-minute limits and falls back along the chain for daily limits or outages.",
+  "_price_sheets_help": "Add one entry per brand. type 'excel' = local .xlsx/.xlsm (re-read automatically when the file is saved). type 'google_sheets' = live Google Sheet: {\"type\": \"google_sheets\", \"sheet_id\": \"<id from the URL>\", \"refresh_seconds\": 300, \"display_name\": \"...\"} shared as 'anyone with the link can view'.",
+  "chat": {
+    "max_message_chars": 4000,
+    "recent_exchanges_verbatim": 10,
+    "_help": "max_message_chars: longest message a user can send. recent_exchanges_verbatim: how many recent user/assistant exchanges the agent sees word-for-word; older ones are folded into a running summary (nothing is lost: facts and quotes also live in long-term memory)."
+  }
+}

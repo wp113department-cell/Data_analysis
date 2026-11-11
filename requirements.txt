@@ -1,8 +1,11 @@
 streamlit
 langchain
+langchain-core
 langchain-groq
+langchain-openai
 langgraph
+langgraph-checkpoint-sqlite
 python-dotenv
-pandas
-matplotlib
-typing_extensions
+openpyxl
+fpdf2
+pydantic

@@ -1,6 +1,6 @@
 # Installation Guide
 
-This guide walks you through setting up and running the **AI Data Analyst Agent** on your machine, step by step. No prior experience needed.
+This guide walks you through setting up and running the **Helper Quote** chatbot on your machine, step by step. No prior experience needed.
 
 ## 1. Install Python
 
@@ -96,11 +96,12 @@ Your browser should automatically open to `http://localhost:8501`. If it doesn't
 
 ## 8. Try It Out
 
-1. In the sidebar, upload `data/sample_data.csv` (included in this project).
-2. Wait for the green "Loaded" confirmation.
-3. Type a question, e.g. *"Which product generated the highest revenue?"*
-4. Click **Analyze**.
-5. Expand the **Statistics**, **Charts**, **AI Insights**, and **Final Report** sections to see the results.
+1. Make sure the HCC price workbook path in `config/settings.json` points to your file.
+2. Type in the chat, e.g. *"I'm John, 407-555-0199. Quote 2 W2136 in white shaker, not assembled, pickup."*
+3. Open **Thinking & steps** to watch the agent read the sheet and decide.
+4. The quote appears as a card with a **Download quote** button (printable HTML).
+5. Optional: set `STAFF_PIN` in `.env`, unlock **Staff mode** in the sidebar and teach a rule:
+   *"Remember: espresso color goes to JSI."*
 
 ---
 
@@ -111,15 +112,6 @@ Your browser should automatically open to `http://localhost:8501`. If it doesn't
 | `GROQ_API_KEY is missing` error | Make sure `.env` exists in the project root and contains a valid key, then restart Streamlit. |
 | `streamlit: command not found` | Make sure your virtual environment is activated before running the command. |
 | PowerShell blocks `Activate.ps1` | Run PowerShell as Administrator and execute: `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` |
-| CSV upload fails | Make sure the file is a valid, non-empty `.csv` file. |
-| Charts don't show up | Make sure `matplotlib` installed correctly (`pip show matplotlib`). |
-| Slow or failed AI responses | Check your internet connection and that your Groq API key is valid and has quota remaining. |
-
-## Expected Output
-
-When everything works, you should see:
-
-- A clean web page titled **"AI Data Analyst Agent"**
-- A sidebar with upload, API status (green), and reset controls
-- A data preview table after uploading a CSV
-- After clicking **Analyze**: statistics tables, relevant charts, an AI-written insights section, and a downloadable markdown report
+| Replies are very slow / "rate limit" | Groq's free tier allows ~8K tokens/minute for gpt-oss-120b; an agent needs more. The app waits and retries, but use Groq's Dev tier for real use. |
+| Price sheet shows an error in the sidebar | Check the `path` in `config/settings.json` and that the workbook was saved by Excel (cached values are needed). |
+| Bot forgot everything | Memory lives in `storage/`. Don't delete that folder (it is git-ignored on purpose). |
