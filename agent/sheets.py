@@ -23,6 +23,7 @@ import threading
 import time
 import urllib.request
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import openpyxl
@@ -40,7 +41,14 @@ class SheetSource:
         if self.spec.get("type", "excel") == "google_sheets":
             refresh = max(int(self.spec.get("refresh_seconds", 300)), 30)
             return int(time.time() // refresh)
-        return resolve_path(self.spec["path"]).stat().st_mtime
+        return self._excel_file()[0].stat().st_mtime
+
+    def _excel_file(self):
+        """(path, encrypted?) - the plain workbook if present, else its encrypted copy (public-repo deploys)."""
+        plain = resolve_path(self.spec["path"])
+        if plain.exists() or not self.spec.get("encrypted_path"):
+            return plain, False
+        return resolve_path(self.spec["encrypted_path"]), True
 
     def load(self):
         """Return (values_workbook, formulas_workbook, label, modified)."""
@@ -51,7 +59,19 @@ class SheetSource:
             values = openpyxl.load_workbook(io.BytesIO(data), data_only=True)
             formulas = openpyxl.load_workbook(io.BytesIO(data), data_only=False)
             return values, formulas, "Google Sheet", datetime.now()
-        path = resolve_path(self.spec["path"])
+        path, encrypted = self._excel_file()
+        if encrypted:
+            import os
+
+            from cryptography.fernet import Fernet
+
+            key = os.getenv("PRICE_SHEET_KEY")
+            if not key:
+                raise ValueError("PRICE_SHEET_KEY is missing - needed to open the encrypted price sheet")
+            data = Fernet(key.encode()).decrypt(path.read_bytes())  # decrypted in memory only
+            values = openpyxl.load_workbook(io.BytesIO(data), data_only=True)
+            formulas = openpyxl.load_workbook(io.BytesIO(data), data_only=False)
+            return values, formulas, Path(self.spec["path"]).name, datetime.fromtimestamp(path.stat().st_mtime)
         values = openpyxl.load_workbook(path, data_only=True)
         formulas = openpyxl.load_workbook(path, data_only=False)
         return values, formulas, path.name, datetime.fromtimestamp(path.stat().st_mtime)

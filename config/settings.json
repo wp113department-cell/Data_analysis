@@ -14,7 +14,8 @@
       "display_name": "Heritage Craft Cabinetry - Signature Series",
       "type": "excel",
       "path": "Copy of HCC Signature Series Quote.xlsm",
-      "multiplier_cell": "Worksheet!H7"
+      "multiplier_cell": "Worksheet!H7",
+      "encrypted_path": "price_lists/HCC.xlsm.enc"
     }
   },
   "models": {
@@ -53,7 +54,7 @@
     "groq:qwen/qwen3.8-27b": 8000
   },
   "_rate_limits_help": "Tokens-per-minute limit per model, read from Groq's x-ratelimit headers for this account (Groq free tier: 8,000/min, 1,000 requests/day; gpt-oss also 200,000 tokens/day). OpenRouter free models: ~20 requests/min and 50/day on a key without credits. The app waits for per-minute limits and falls back along the chain for daily limits or outages.",
-  "_price_sheets_help": "Add one entry per brand. type 'excel' = local .xlsx/.xlsm (re-read automatically when the file is saved). type 'google_sheets' = live Google Sheet: {\"type\": \"google_sheets\", \"sheet_id\": \"<id from the URL>\", \"refresh_seconds\": 300, \"display_name\": \"...\"} shared as 'anyone with the link can view'. multiplier_cell = the cell holding the price multiplier; its live value is shown to the agent and create_quote must match it.",
+  "_price_sheets_help": "Add one entry per brand. type 'excel' = local .xlsx/.xlsm (re-read automatically when the file is saved). type 'google_sheets' = live Google Sheet: {\"type\": \"google_sheets\", \"sheet_id\": \"<id from the URL>\", \"refresh_seconds\": 300, \"display_name\": \"...\"} shared as 'anyone with the link can view'. multiplier_cell = the cell holding the price multiplier; its live value is shown to the agent and create_quote must match it. encrypted_path = encrypted copy committed to the repo (scripts/encrypt_price_sheet.py); used when the plain workbook isn't present, unlocked with PRICE_SHEET_KEY.",
   "chat": {
     "max_message_chars": 4000,
     "recent_exchanges_verbatim": 10,

@@ -13,3 +13,4 @@ celery[redis]
 pypdf
 pypdfium2
 pillow-heif
+cryptography

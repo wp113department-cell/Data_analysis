@@ -146,6 +146,13 @@ CUSTOM_CSS = """
   font-weight: 600; color: var(--plum); }
 [class*="st-key-thread_"] [data-testid="stBaseButton-primary"] { background: var(--lav) !important; }
 [class*="st-key-thread_"] button:hover { background: var(--cream); }
+[class*="st-key-del_"] button[data-testid="stPopoverButton"] {
+  border: none !important; background: transparent !important; color: var(--muted) !important; padding: 0 !important;
+  min-height: 2rem; }
+[class*="st-key-del_"] button[data-testid="stPopoverButton"]:hover { color: #B3261E !important; }
+[class*="st-key-del_"] button[data-testid="stPopoverButton"] > div > div[aria-hidden="true"] { display: none; }  /* no chevron */
+[class*="st-key-confirmdel_"] button { background: #B3261E !important; border-color: #B3261E !important; color: #FFFFFF !important; }
+[class*="st-key-confirmdel_"] button p { color: #FFFFFF !important; }
 .status-pill { display: flex; align-items: center; gap: 0.5rem; background: var(--cream); border: 1px solid var(--sand);
   border-radius: 12px; padding: 0.45rem 0.75rem; font-size: 0.8rem; margin-bottom: 0.4rem; color: var(--plum); }
 .status-pill .led { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
@@ -175,6 +182,12 @@ def init_session() -> None:
 def new_chat() -> None:
     st.session_state["thread_id"] = uuid.uuid4().hex[:12]
     st.query_params["chat"] = st.session_state["thread_id"]
+
+
+def delete_chat(thread_id: str) -> None:
+    memory.delete_thread(thread_id)
+    if st.session_state.get("thread_id") == thread_id:
+        new_chat()
 
 
 def open_chat(thread_id: str) -> None:
@@ -207,7 +220,8 @@ def render_sidebar() -> None:
             st.caption("No conversations yet.")
         for t in threads:
             current = t["thread_id"] == st.session_state["thread_id"]
-            st.button(
+            title_col, del_col = st.columns([6, 1], gap=None, vertical_alignment="center")
+            title_col.button(
                 thread_label(t),
                 key=f"thread_{t['thread_id']}",
                 width="stretch",
@@ -215,6 +229,11 @@ def render_sidebar() -> None:
                 on_click=open_chat,
                 args=(t["thread_id"],),
             )
+            with del_col.popover("", icon=":material/close:", key=f"del_{t['thread_id']}", help="Delete this chat"):
+                st.markdown("**Delete this chat?**")
+                st.caption("Messages and uploaded files are removed. Quotes stay in the customer's history.")
+                st.button("Delete", key=f"confirmdel_{t['thread_id']}", type="primary", width="stretch",
+                          on_click=delete_chat, args=(t["thread_id"],))
 
         st.markdown('<div class="side-label">Mode</div>', unsafe_allow_html=True)
         render_mode_switch()

@@ -27,10 +27,14 @@ def worker_alive() -> bool:
         return _worker_cache["alive"]
     alive = False
     try:
-        from agent.uploads.celery_app import app
+        import redis
 
+        from agent.uploads.celery_app import REDIS_URL, app
+
+        # Fail fast when there is no Redis at all (e.g. Streamlit Cloud): don't let Celery retry connecting.
+        redis.Redis.from_url(REDIS_URL, socket_connect_timeout=0.5, socket_timeout=0.5).ping()
         alive = bool(app.control.ping(timeout=1.0))
-    except Exception:  # noqa: BLE001 - no broker / no worker
+    except Exception:  # noqa: BLE001 - no broker / no worker -> read files in a background thread
         alive = False
     _worker_cache.update(at=time.time(), alive=alive)
     return alive

@@ -242,5 +242,12 @@ def list_threads(limit: int = 25) -> List[Dict[str, Any]]:
 
 
 def delete_thread(thread_id: str) -> None:
+    """Delete a conversation: its messages, its uploaded files and any open hand-off flag.
+    Quotes are kept - they belong to the customer's history."""
+    import shutil
+
     get_store().delete(THREADS, thread_id)
+    get_store().delete(HANDOFFS, thread_id)
     get_checkpointer().delete_thread(thread_id)
+    safe = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in thread_id)
+    shutil.rmtree(STORAGE_DIR / "uploads" / safe, ignore_errors=True)
