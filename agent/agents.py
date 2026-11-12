@@ -47,6 +47,9 @@ PROVIDERS = {
     # Optional providers - used only when their key is in .env and they appear in a model chain.
     "anthropic": {"key_env": "ANTHROPIC_API_KEY"},
     "gemini": {"key_env": "GEMINI_API_KEY", "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/"},
+    # Cloudflare Workers AI (OpenAI-compatible); the URL needs CLOUDFLARE_ACCOUNT_ID too.
+    "cloudflare": {"key_env": "CLOUDFLARE_API_TOKEN",
+                   "base_url": "https://api.cloudflare.com/client/v4/accounts/{account}/ai/v1"},
 }
 
 
@@ -110,6 +113,27 @@ def agent_max_output_tokens() -> int:
     return int(load_settings().get("models", {}).get("agent_max_output_tokens", 2048))
 
 
+@lru_cache(maxsize=1)
+def _cloudflare_chat_class():
+    """Cloudflare Workers AI only accepts message content as a plain string; LangChain sometimes sends
+    lists of content blocks (e.g. once the history has tool results). Flatten them before sending."""
+    from langchain_openai import ChatOpenAI
+
+    class CloudflareChat(ChatOpenAI):
+        def _get_request_payload(self, input_, *, stop=None, **kwargs):
+            payload = super()._get_request_payload(input_, stop=stop, **kwargs)
+            for msg in payload.get("messages", []):
+                content = msg.get("content")
+                if isinstance(content, list):
+                    msg["content"] = "\n".join(
+                        part.get("text", "") if isinstance(part, dict) else str(part) for part in content)
+                elif content is None:
+                    msg["content"] = ""
+            return payload
+
+    return CloudflareChat
+
+
 @lru_cache(maxsize=16)
 def _make_llm(model_id: str, temperature: float, reasoning_effort: str | None, max_tokens: int):
     provider, name = split_model(model_id)
@@ -130,6 +154,16 @@ def _make_llm(model_id: str, temperature: float, reasoning_effort: str | None, m
 
         return ChatOpenAI(model=name, api_key=api_key, base_url=PROVIDERS["gemini"]["base_url"],
                           temperature=temperature, max_tokens=max_tokens, max_retries=0, timeout=120)
+    if provider == "cloudflare":
+        from langchain_openai import ChatOpenAI
+
+        account = os.getenv("CLOUDFLARE_ACCOUNT_ID", "")
+        if not account:
+            raise ValueError("CLOUDFLARE_ACCOUNT_ID is missing. Add it to the .env file.")
+        extra = {"reasoning_effort": reasoning_effort} if reasoning_effort and "gpt-oss" in name else {}
+        return _cloudflare_chat_class()(model=name, api_key=api_key, temperature=temperature, max_tokens=max_tokens,
+                          base_url=PROVIDERS["cloudflare"]["base_url"].format(account=account),
+                          max_retries=0, timeout=120, **extra)
     if provider == "openrouter":
         from langchain_openai import ChatOpenAI
 
@@ -186,6 +220,8 @@ def get_llm(role: str = "agent", temperature: float = 0.2, model: str | None = N
     if role == "agent":
         effort = load_settings().get("models", {}).get("agent_reasoning_effort", "medium")
         return _make_llm(model, temperature, effort, agent_max_output_tokens())
+    if role == "vision":
+        return _make_llm(model, temperature, None, 8192)  # long item lists from big layouts
     return _make_llm(model, temperature, "low", 1024)
 
 

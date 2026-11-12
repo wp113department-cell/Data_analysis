@@ -18,6 +18,7 @@ Limits per model come from config/settings.json -> "rate_limits".
 from __future__ import annotations
 
 import json
+import logging
 import re
 import threading
 import time
@@ -25,6 +26,8 @@ from collections import deque
 from typing import Any, Callable, Deque, Dict, Optional, Sequence, Tuple
 
 from agent.agents import load_settings
+
+log = logging.getLogger("helper_quote.llm")
 
 WINDOW_SECONDS = 60.0
 SAFETY = 0.92            # keep a margin below the hard per-minute limit
@@ -39,6 +42,10 @@ class DailyLimitReached(Exception):
         super().__init__(message or f"Daily limit reached for {model}")
         self.model = model
         self.retry_after = retry_after
+
+
+class ModelBusy(DailyLimitReached):
+    """Per-minute budget full right now: switch to another provider instead of waiting."""
 
 
 class RequestTooLarge(Exception):
@@ -119,8 +126,8 @@ class TokenBudget:
 
     # -- daily exhaustion ----------------------------------------------------
 
-    def mark_exhausted(self, model: str, seconds: float) -> None:
-        self._exhausted_until[model] = time.time() + max(seconds, 30)
+    def mark_exhausted(self, model: str, seconds: float, minimum: float = 30) -> None:
+        self._exhausted_until[model] = time.time() + max(seconds, minimum)
 
     def exhausted_for(self, model: str) -> float:
         """Seconds until the model's daily limit resets (0 = available)."""
@@ -134,8 +141,10 @@ class TokenBudget:
             q.popleft()
         return sum(tokens for _, tokens in q)
 
-    def wait_for_room(self, model: str, needed: int, notify: Optional[Callable[[int], None]] = None) -> None:
-        """Block until `needed` tokens fit in the model's per-minute budget."""
+    def wait_for_room(self, model: str, needed: int, notify: Optional[Callable[[int], None]] = None,
+                      allow_wait: bool = True) -> None:
+        """Block until `needed` tokens fit in the model's per-minute budget. With allow_wait=False,
+        a full budget marks the model busy and raises at once, so the caller switches provider."""
         limit = self.limit_for(model)
         if not limit:
             return
@@ -155,6 +164,9 @@ class TokenBudget:
                         wait = ts + WINDOW_SECONDS - now
                         break
             wait = max(1.0, min(wait, WINDOW_SECONDS))
+            if not allow_wait:
+                self.mark_exhausted(model, wait, minimum=wait)
+                raise ModelBusy(model, wait)
             if notify:
                 notify(int(wait))
             time.sleep(wait)
@@ -182,7 +194,8 @@ def get_budget() -> TokenBudget:
 
 
 def invoke_with_budget(llm: Any, model: str, messages: Sequence[Any], tools: Optional[Sequence[Any]] = None,
-                       max_output: int = 0, notify: Optional[Callable[[int], None]] = None) -> Any:
+                       max_output: int = 0, notify: Optional[Callable[[int], None]] = None,
+                       allow_wait: bool = True) -> Any:
     """
     Invoke an LLM after making sure it fits the per-minute budget. Short
     rate-limit waits are absorbed here; daily limits raise DailyLimitReached.
@@ -193,7 +206,7 @@ def invoke_with_budget(llm: Any, model: str, messages: Sequence[Any], tools: Opt
 
     needed = estimate_tokens(messages, tools, max_output)
     for attempt in range(MAX_RETRIES + 1):
-        _budget.wait_for_room(model, needed, notify)
+        _budget.wait_for_room(model, needed, notify, allow_wait=allow_wait)
         try:
             result = llm.invoke(list(messages))
         except Exception as exc:  # noqa: BLE001
@@ -215,6 +228,9 @@ def invoke_with_budget(llm: Any, model: str, messages: Sequence[Any], tools: Opt
             if _is_daily(message) or wait > MAX_SHORT_WAIT:
                 _budget.mark_exhausted(model, wait)
                 raise DailyLimitReached(model, wait, message) from exc
+            if not allow_wait:  # another provider is available: switch now, come back after the window
+                _budget.mark_exhausted(model, wait + 1, minimum=wait + 1)
+                raise ModelBusy(model, wait + 1, message) from exc
             if attempt == MAX_RETRIES:
                 raise
             if notify:
@@ -228,7 +244,7 @@ def invoke_with_budget(llm: Any, model: str, messages: Sequence[Any], tools: Opt
     raise RuntimeError("unreachable")
 
 
-def invoke_with_fallbacks(role: str, make_runnable: Callable[[Any], Any],
+def _invoke_chain(role: str, make_runnable: Callable[[Any], Any],
                           messages_for: Callable[[str, float], Sequence[Any]],
                           tools: Optional[Sequence[Any]] = None, max_output: int = 0,
                           notify: Optional[Callable[[int], None]] = None,
@@ -243,17 +259,22 @@ def invoke_with_fallbacks(role: str, make_runnable: Callable[[Any], Any],
 
     waits: list = []
     last_error: Optional[Exception] = None
-    for model in role_models(role):
+    chain = role_models(role)
+    for model in chain:
         remaining = _budget.exhausted_for(model)
         if remaining:
             waits.append(remaining)
             continue
+        # Switch providers instantly when a model's per-minute budget is full; only the LAST
+        # usable model in the chain is allowed to wait for its window.
+        later = [m for m in chain[chain.index(model) + 1:] if not _budget.exhausted_for(m)]
+        allow_wait = not later
         runnable = make_runnable(get_llm(role, temperature=temperature, model=model))
         try:
             for factor in (0.85, 0.6):  # retry once, tighter, if the request is too large
                 try:
                     result = invoke_with_budget(runnable, model, messages_for(model, factor), tools,
-                                                max_output=max_output, notify=notify)
+                                                max_output=max_output, notify=notify, allow_wait=allow_wait)
                 except RequestTooLarge as exc:
                     last_error = exc
                     continue
@@ -266,10 +287,36 @@ def invoke_with_fallbacks(role: str, make_runnable: Callable[[Any], Any],
             last_error = exc
         except Exception as exc:  # noqa: BLE001
             text = str(exc).lower()
-            if "tool_use_failed" in text or "failed to call a function" in text or "rate limit" in text:
-                last_error = exc  # broken tool call / unexpected limit from this model -> next model
+            from_provider = getattr(exc, "status_code", None) is not None or type(exc).__module__.split(".")[0] in (
+                "openai", "groq", "anthropic", "httpx", "httpx2", "langchain_openai", "langchain_groq")
+            if from_provider or "tool_use_failed" in text or "failed to call a function" in text or "rate limit" in text:
+                log.warning("model %s failed for %s (%s: %s) - trying the next model", model, role,
+                            type(exc).__name__, str(exc)[:300])
+                last_error = exc  # this provider rejected the request -> next model in the chain
                 continue
             raise
     if waits:
         raise AllModelsBusy(min(waits))
     raise last_error or RuntimeError(f"No model available for {role}")
+
+
+def invoke_with_fallbacks(role: str, make_runnable: Callable[[Any], Any],
+                          messages_for: Callable[[str, float], Sequence[Any]],
+                          tools: Optional[Sequence[Any]] = None, max_output: int = 0,
+                          notify: Optional[Callable[[int], None]] = None,
+                          temperature: float = 0.2,
+                          accept: Optional[Callable[[Any], bool]] = None) -> Tuple[Any, str]:
+    """
+    Run a call on the role's model chain, switching providers instantly on limits/outages.
+    If every model is only briefly busy (per-minute windows), wait for the soonest one once.
+    """
+    for attempt in range(2):
+        try:
+            return _invoke_chain(role, make_runnable, messages_for, tools, max_output, notify, temperature, accept)
+        except AllModelsBusy as exc:
+            if attempt == 1 or exc.retry_after > MAX_SHORT_WAIT:
+                raise
+            if notify:
+                notify(int(exc.retry_after) + 1)
+            time.sleep(exc.retry_after + 1)
+    raise RuntimeError("unreachable")

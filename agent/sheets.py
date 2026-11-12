@@ -97,10 +97,20 @@ class Workbooks:
                     "last_updated": e["modified"].isoformat(timespec="minutes"),
                     "tabs": [{"name": ws.title, "rows": ws.max_row, "columns": ws.max_column}
                              for ws in e["values"].worksheets],
+                    **({"multiplier": self.cell(brand, e["spec"]["multiplier_cell"]),
+                        "multiplier_cell": e["spec"]["multiplier_cell"]}
+                       if e["spec"].get("multiplier_cell") else {}),
                 })
             except Exception as exc:  # noqa: BLE001 - reported to the agent/UI
                 out.append({"brand": brand, "error": str(exc)})
         return out
+
+    def cell(self, brand: str, ref: str) -> Any:
+        """Live value of one cell, e.g. 'Worksheet!H7' (re-read whenever the sheet changes)."""
+        e = self._get(brand)
+        tab, _, addr = ref.rpartition("!")
+        ws = e["values"][tab or e["values"].sheetnames[0]][addr]
+        return self._cell(e, ws.parent.title, ws.row, ws.column)
 
     def _cell(self, e, ws_name: str, row: int, col: int) -> Any:
         value = e["values"][ws_name].cell(row, col).value
@@ -114,7 +124,8 @@ class Workbooks:
             return value.date().isoformat()
         return value
 
-    def _row(self, e, ws_name: str, row: int, max_col: int, header_row: Optional[int]) -> str:
+    def _row(self, e, ws_name: str, row: int, max_col: int, header_row: Optional[int],
+             columns: Optional[List[str]] = None) -> str:
         """One row as a compact line: 'B Item #=W2136 | C Description=... | L Mercury White=412'."""
         cells = []
         for col in range(1, max_col + 1):
@@ -122,6 +133,8 @@ class Workbooks:
             if v is None or v == "":
                 continue
             key = get_column_letter(col)
+            if columns and key not in columns:
+                continue
             if header_row:
                 label = e["values"][ws_name].cell(header_row, col).value
                 if label not in (None, ""):
@@ -142,36 +155,46 @@ class Workbooks:
         return "\n".join(lines)
 
     def search(self, brand: str, texts: List[str], tab: Optional[str] = None,
-               header_row: Optional[int] = None, limit_per_text: int = 12) -> str:
+               header_row: Optional[int] = None, limit_per_text: int = 12,
+               columns: Optional[List[str]] = None) -> str:
         e = self._get(brand)
         tabs = [tab] if tab else [ws.title for ws in e["values"].worksheets]
         lines = [f"[{brand}] search results"]
 
-        def find(needle: str, limit: int) -> List[str]:
+        def find(needle: str, limit: int, exact: bool) -> List[str]:
+            """exact=True: a cell equals the text; exact=False: a cell contains it."""
             hits: List[str] = []
             for name in tabs:
                 ws = e["values"][name]
                 for row in ws.iter_rows():
-                    if any(c.value is not None and needle in str(c.value).lower() for c in row):
+                    cells = [str(c.value).strip().lower() for c in row if c.value is not None]
+                    if any((v == needle) if exact else (needle in v) for v in cells):
                         r = row[0].row
-                        hits.append(f"  {name} row {r}: {self._row(e, name, r, ws.max_column, header_row)}")
+                        hits.append(f"  {name} row {r}: {self._row(e, name, r, ws.max_column, header_row, cols)}")
                         if len(hits) >= limit:
                             return hits
             return hits
 
+        cols = [c.strip().upper() for c in columns] if columns else None
         for text in texts:
             needle = str(text).strip().lower()
-            hits = find(needle, limit_per_text)
-            if hits:
-                lines.append(f'"{text}": {len(hits)} match(es)')
-                lines.extend(hits)
+            exact = find(needle, 3, exact=True)
+            if exact:
+                lines.append(f'"{text}": EXACT MATCH')
+                lines.extend(exact)
                 continue
-            # No exact match: shorten the text step by step and return the closest REAL rows,
+            partial = find(needle, 6, exact=False)
+            if partial:
+                lines.append(f'"{text}": NO EXACT MATCH - these rows only CONTAIN "{text}" and are DIFFERENT items '
+                             "(ask the customer, never substitute silently):")
+                lines.extend(partial)
+                continue
+            # Nothing contains it: shorten the text step by step and return the closest REAL rows,
             # so alternatives offered to the customer always come from the sheet.
             closest, prefix = [], needle
             while not closest and len(prefix) > 3:
                 prefix = prefix[:-1]
-                closest = find(prefix, 8)
+                closest = find(prefix, 8, exact=False)
             if closest:
                 lines.append(f'"{text}": NO EXACT MATCH. Closest real items (rows containing "{prefix}"):')
                 lines.extend(closest)

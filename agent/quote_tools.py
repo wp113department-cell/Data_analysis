@@ -25,6 +25,8 @@ Long-term memory
     learn_rule             (staff only) teach a new business rule
 Escalation
     hand_off_to_designer   flag the chat "Needs you" for a human designer
+Uploads
+    read_uploaded_files    what the vision worker found in the customer's layouts / photos / PDFs
 """
 
 from __future__ import annotations
@@ -77,6 +79,9 @@ def sheet_overview(brand: str) -> str:
     """One-call overview of a brand's workbook: the top 30 and last 10 non-empty rows of
     every tab. Use it ONCE to learn a sheet's layout (line options, multiplier, header row,
     fees), then save_sheet_notes."""
+    guide = next((v for b, v in memory.sheet_guides().items() if b.lower() == brand.strip().lower()), None)
+    if guide:  # a verified guide already describes this layout - no need for a 3k-token sheet dump
+        return f"{brand} has a VERIFIED layout guide - use it (also in SHEET NOTES):\n{guide['notes']}"
     try:
         notes_saved = any(b.lower() == brand.strip().lower() for b in memory.sheet_notes())
         return get_workbooks().overview(brand) + ("" if notes_saved else (
@@ -99,13 +104,14 @@ def read_price_sheet(brand: str, tab: str, start_row: int, end_row: int, header_
 
 
 @tool
-def search_price_sheet(brand: str, texts: List[str], tab: Optional[str] = None, header_row: Optional[int] = None) -> str:
-    """Find rows in a brand's price workbook that contain any of the given texts
-    (case-insensitive, partial match) - e.g. ['W2136', 'LS36'] or ['Lazy Susan'].
-    Search many SKUs in one call. Pass the product tab and header_row to get each
-    cell labeled with its column header (e.g. which price column belongs to which line)."""
+def search_price_sheet(brand: str, texts: List[str], tab: Optional[str] = None, header_row: Optional[int] = None,
+                       columns: Optional[List[str]] = None) -> str:
+    """Look up many codes/words in one call, e.g. ['W2136', 'LS36']. Each result says EXACT MATCH,
+    or NO EXACT MATCH with the closest real rows (different items - ask, never substitute).
+    Pass tab + header_row to label cells, and columns (e.g. ['B','C','L'] = code, description,
+    the chosen line's price column) to get short results."""
     try:
-        return get_workbooks().search(brand, texts, tab, header_row)
+        return get_workbooks().search(brand, texts, tab, header_row, columns=columns)
     except Exception as exc:  # noqa: BLE001
         return _json({"error": str(exc)})
 
@@ -198,6 +204,8 @@ class CreateQuoteInput(BaseModel):
     extras: List[QuoteExtra] = Field(default_factory=list)
     unpriced_items: List[str] = Field(default_factory=list, description="Codes a designer must review")
     revises: Optional[str] = Field(default=None, description="Quote number this one replaces, when editing a quote")
+    source_upload_id: Optional[str] = Field(default=None, description="Upload id, when the items came from attached files")
+    customer_confirmed_list: bool = Field(default=False, description="True only after the customer said yes to the final list")
     notes: str = ""
 
 
@@ -217,6 +225,8 @@ def create_quote(
     extras: Optional[List[Any]] = None,
     unpriced_items: Optional[List[str]] = None,
     revises: Optional[str] = None,
+    source_upload_id: Optional[str] = None,
+    customer_confirmed_list: bool = False,
     notes: str = "",
     config: RunnableConfig = None,
 ) -> str:
@@ -243,12 +253,19 @@ def create_quote(
         texts = {str(v).strip().upper() for v in row if v is not None}
         numbers = {float(v) for v in row if isinstance(v, (int, float)) and not isinstance(v, bool)}
         if it["sku"].strip().upper() not in texts:
-            problems.append(f"{it['sku']}: not found on {it['sheet_tab']} row {it['sheet_row']}")
+            shown = [str(v) for v in row if isinstance(v, str) and v.strip() and not v.startswith("=")][:2]
+            problems.append(f"{it['sku']}: not found on {it['sheet_tab']} row {it['sheet_row']} - that row contains "
+                            f"{shown}; use the SKU exactly as written there (fix it yourself, no need to ask)")
         if float(it["msrp"]) not in numbers:
             problems.append(f"{it['sku']}: MSRP {it['msrp']} is not a value on {it['sheet_tab']} row {it['sheet_row']}")
+    sheet_info = next((wb for wb in workbooks.list_workbooks() if wb.get("brand", "").lower() == brand.lower()), {})
     try:
-        tabs = next((wb.get("tabs", []) for wb in workbooks.list_workbooks()
-                     if wb.get("brand", "").lower() == brand.lower()), [])
+        if "multiplier" in sheet_info:  # configured cell: must match its LIVE value exactly
+            live = float(sheet_info["multiplier"])
+            if abs(float(multiplier) - live) > 1e-9:
+                problems.append(f"Multiplier must be {live} (live value of {sheet_info['multiplier_cell']}), not {multiplier}")
+            raise StopIteration
+        tabs = sheet_info.get("tabs", [])
         sheet_numbers = {
             float(v)
             for t in tabs
@@ -258,8 +275,26 @@ def create_quote(
         }
         if float(multiplier) not in sheet_numbers:
             problems.append(f"Multiplier {multiplier} was not found in the top of the {brand} sheet")
+    except StopIteration:
+        pass
     except Exception as exc:  # noqa: BLE001
         problems.append(f"Could not verify multiplier: {exc}")
+    thread_id_ = _configurable(config).get("thread_id")
+    upload = (memory.get_thread(thread_id_) or {}).get("active_upload") if thread_id_ else None
+    if upload and not upload.get("quoted"):
+        # Quote built from uploaded files: every line must be accounted for, and the customer must confirm.
+        lines = upload.get("lines", [])
+        covered = len(items) + len(unpriced_items or [])
+        if covered < len(lines):
+            problems.append(
+                f"The customer's files have {len(lines)} lines but this quote accounts for only {covered} "
+                f"({len(items)} priced + {len(unpriced_items or [])} unpriced). Every line must be either a priced item "
+                "or listed in unpriced_items (e.g. 'B15 trash pull-out - not in HCC, designer to confirm'). "
+                "Lines from the files: " + "; ".join(lines))
+        if not customer_confirmed_list:
+            problems.append("These items came from the customer's files: show the final list (qty x code, plus anything "
+                            "unpriced) with ask_customer and get a yes first, then call create_quote with "
+                            "customer_confirmed_list=true.")
     if problems:
         return _json({"status": "not_created", "problems": problems,
                       "fix": "Re-read the sheet rows and correct the SKU/MSRP/row/multiplier, then call create_quote again."})
@@ -311,6 +346,8 @@ def create_quote(
         "thread_id": _configurable(config).get("thread_id"),
     }
     memory.save_quote(cust_key, quote)
+    if upload and not upload.get("quoted") and thread_id_:
+        memory.update_thread(thread_id_, active_upload={**upload, "quoted": True})
     if quote["thread_id"]:
         memory.update_thread(quote["thread_id"], customer=cust_key, status=f"Quote {quote['quote_number']}")
 
@@ -425,9 +462,41 @@ def hand_off_to_designer(reason: str, summary: str, urgency: str = "normal", con
     return _json({"saved": True, "status": "A designer has been notified and will follow up."})
 
 
+@tool
+def read_uploaded_files(upload_id: str, config: RunnableConfig = None) -> str:
+    """Get what was found in the files (layout drawings, photos of lists, PDFs) the customer
+    attached - codes exactly as written, quantities, locations, colors, measurements,
+    customer details and anything unsure. Treat it as a draft to check, not as final."""
+    from agent.uploads import jobs
+
+    thread_id = _configurable(config).get("thread_id")
+    if not thread_id:
+        return _json({"error": "No conversation id."})
+    st = jobs.status(thread_id, upload_id)
+    if st.get("state") == "done":
+        text = jobs.result_text(thread_id, upload_id)
+        if not text:
+            return _json({"error": "Result missing."})
+        lines = jobs.extracted_lines(thread_id, upload_id)
+        memory.update_thread(thread_id, active_upload={"id": upload_id, "lines": lines, "quoted": False})
+        return text + (
+            "\n\nNEXT (keep it to a few steps): 1) convert designer codes per the playbook (BER36-L->LS36, drop a "
+            "trailing L/R hinge suffix - no question needed); 2) ONE search_price_sheet with ALL codes, using the "
+            "guide's tab, header_row and columns=[code col, description col, the line's price col]; 3) for each code "
+            "with NO EXACT MATCH or UNSURE, ask_customer with the real alternatives; 4) ONE ask_customer showing the "
+            "final list (qty x code) for a yes; 5) create_quote with source_upload_id=" + upload_id +
+            " and customer_confirmed_list=true. Use the multiplier from PRICE SHEETS LOADED.")
+    if st.get("state") == "error":
+        return _json({"state": "error", "detail": st.get("error"),
+                      "next": "Apologise, and ask the customer to type the list or try a clearer photo/PDF."})
+    return _json({"state": st.get("state"), "progress": st.get("progress"), "status": st.get("status"),
+                  "next": "Still reading - tell the customer you're reading their files and will continue "
+                          "automatically when done. Don't guess the contents."})
+
+
 CUSTOMER_TOOLS = [
     sheet_overview, search_price_sheet, save_sheet_notes, calculator,
-    ask_customer, create_quote, get_saved_quote, find_customer, hand_off_to_designer,
+    ask_customer, create_quote, get_saved_quote, find_customer, hand_off_to_designer, read_uploaded_files,
 ]
 STAFF_TOOLS = CUSTOMER_TOOLS + [learn_rule]
 
@@ -445,4 +514,5 @@ TOOL_LABELS = {
     "save_customer_details": "Saving customer details",
     "learn_rule": "Learning a new rule",
     "hand_off_to_designer": "Handing over to a designer",
+    "read_uploaded_files": "Reading your files",
 }

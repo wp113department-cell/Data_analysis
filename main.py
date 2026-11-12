@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import os
 import time
 import uuid
@@ -27,10 +28,14 @@ from agent.graph import get_graph, run_config
 from agent.quote_document import render_quote_pdf
 from agent.quote_tools import TOOL_LABELS
 from agent.rate_limit import AllModelsBusy
+from agent.uploads import jobs as upload_jobs
+from agent.uploads.files import save_batch, upload_settings, validate_batch
 from agent.sheets import get_workbooks
 
 AVATAR = str(Path(__file__).parent / "assets" / "helper_avatar.svg")
 AVATAR_DATA_URI = "data:image/svg+xml;base64," + base64.b64encode(Path(AVATAR).read_bytes()).decode()
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
 st.set_page_config(page_title="Helper Quote", page_icon=AVATAR, layout="centered")
 
@@ -91,6 +96,10 @@ CUSTOM_CSS = """
 [class*="st-key-amsg"] [data-testid="stMarkdownContainer"], [class*="st-key-umsg"] [data-testid="stMarkdownContainer"],
 [class*="st-key-quote"] [data-testid="stMarkdownContainer"] { margin-bottom: 0 !important; }
 [class*="st-key-amsg"], [class*="st-key-umsg"] { overflow: visible; gap: 0 !important; }
+.file-chips { display: flex; flex-wrap: wrap; gap: 0.4rem; justify-content: flex-end; margin-top: 0.35rem; }
+.file-chip { display: inline-flex; align-items: center; gap: 0.35rem; background: var(--lav); color: var(--plum-2);
+  border-radius: 999px; padding: 0.25rem 0.75rem; font-size: 0.82rem; font-weight: 600; }
+[class*="st-key-upload_card"] { background: #FFFFFF; border: 1px dashed var(--lav-2); border-radius: 18px; padding: 0.8rem 1rem; }
 .chosen { display: inline-block; background: var(--lav); color: var(--plum-2); border-radius: 999px;
   padding: 0.25rem 0.8rem; font-weight: 600; font-size: 0.9rem; }
 
@@ -438,10 +447,43 @@ def render_pending_question(pending) -> str | list | None:
         return picked
 
 
+@st.cache_data(show_spinner=False, max_entries=300)
+def upright_thumbnail(path: str) -> bytes:
+    """Phone photos are often stored sideways with a rotation tag - show them upright."""
+    from io import BytesIO
+
+    from PIL import Image, ImageOps
+
+    with Image.open(path) as img:
+        img = ImageOps.exif_transpose(img).convert("RGB")
+        img.thumbnail((330, 330))
+        out = BytesIO()
+        img.save(out, format="JPEG", quality=85)
+        return out.getvalue()
+
+
+def render_user_message(text: str, files: list | None = None) -> None:
+    """User bubble + attachment chips (image thumbnails / PDF chips)."""
+    if text.strip():
+        bubble(text, "u")
+    if files:
+        chips = "".join(
+            f'<span class="file-chip">{"📄" if f["kind"] == "pdf" else "🖼️"} {html_escape(f["name"])}'
+            f'{" · " + str(f.get("pages", 1)) + " pages" if f["kind"] == "pdf" else ""}</span>'
+            for f in files)
+        st.markdown(f'<div class="file-chips">{chips}</div>', unsafe_allow_html=True)
+        images = [f for f in files if f["kind"] == "image" and Path(f.get("path", "")).exists()]
+        if images:
+            cols = st.columns([1] * len(images) + [max(1, 6 - len(images))])
+            for col, f in zip(cols[: len(images)], images):
+                col.image(upright_thumbnail(f["path"]), width=110)
+
+
 def render_history(messages) -> None:
     for human, parts in group_turns(messages):
         with st.chat_message("user"):
-            bubble(human.content, "u")
+            upload = human.additional_kwargs.get("upload") or {}
+            render_user_message(human.additional_kwargs.get("visible_text", human.content), upload.get("files"))
         if parts:
             with st.chat_message("assistant", avatar=AVATAR):
                 render_assistant_turn(parts)
@@ -466,17 +508,33 @@ def render_welcome() -> str | None:
     return st.pills("Try", SUGGESTIONS, label_visibility="collapsed", key=f"sugg_{st.session_state['thread_id']}")
 
 
-def run_turn(text, resume: bool = False) -> None:
-    """Send a new message, or (resume=True) answer the agent's pending question."""
+def run_turn(text, resume: bool = False, upload: dict | None = None, show_user: bool = True,
+             continue_run: bool = False) -> None:
+    """Send a new message (optionally with read attachments), answer a pending question (resume=True),
+    or finish a run that was cut off, e.g. the tab was closed mid-reply (continue_run=True)."""
     graph = get_graph()
     config = run_config(st.session_state["thread_id"], st.session_state["role"])
     shown = ", ".join(text) if isinstance(text, list) else str(text)
     thread = memory.get_thread(st.session_state["thread_id"])
-    memory.update_thread(st.session_state["thread_id"], title=thread.get("title") or shown[:60])
-    graph_input = Command(resume=text) if resume else {"messages": [HumanMessage(shown)]}
+    memory.update_thread(st.session_state["thread_id"], title=thread.get("title") or (shown or "Uploaded files")[:60])
+    if continue_run:
+        graph_input = None  # LangGraph picks up from the last saved step
+        show_user = False
+    elif resume:
+        graph_input = Command(resume=text)
+    elif upload:
+        names = ", ".join(f["name"] for f in upload["files"])
+        note = (f"[ATTACHED FILES: {names} | upload id: {upload['upload_id']} | "
+                f"reading {upload.get('state', 'done')}. Use read_uploaded_files.]")
+        graph_input = {"messages": [HumanMessage(
+            f"{shown}\n\n{note}".strip(),
+            additional_kwargs={"visible_text": shown, "upload": {"id": upload["upload_id"], "files": upload["files"]}})]}
+    else:
+        graph_input = {"messages": [HumanMessage(shown)]}
 
-    with st.chat_message("user"):
-        bubble(shown, "u")
+    if show_user:
+        with st.chat_message("user"):
+            render_user_message(shown, (upload or {}).get("files"))
     with st.chat_message("assistant", avatar=AVATAR):
         started = time.perf_counter()
         st.container(key="thinking_now").empty()
@@ -509,6 +567,8 @@ def run_turn(text, resume: bool = False) -> None:
                                "Upgrade to Groq Dev tier or add fallback models in config/settings.json.")
                 return
             except Exception as exc:  # noqa: BLE001
+                logging.getLogger("helper_quote.app").exception(
+                    "turn failed (thread %s)", st.session_state["thread_id"])
                 status.update(label="Something went wrong", state="error", expanded=False)
                 bubble("Sorry, something went wrong on my side while working on that. "
                        "Please send your message again - nothing you told me was lost.")
@@ -516,6 +576,56 @@ def run_turn(text, resume: bool = False) -> None:
                     st.caption(f"Staff detail: {type(exc).__name__}: {str(exc)[:300]}")
                 return
     st.rerun()
+
+
+# ---------------------------------------------------------------------------
+# Uploads (read in the background by Celery workers / a worker thread)
+# ---------------------------------------------------------------------------
+
+def start_upload(text: str, uploaded_files) -> None:
+    """Validate + store the attachments and queue them for the background reader."""
+    tid = st.session_state["thread_id"]
+    accepted, problems = validate_batch([(f.name, f.getvalue()) for f in uploaded_files])
+    st.session_state["upload_problems"] = problems
+    if not accepted:
+        if text.strip():
+            run_turn(text)
+        return
+    batch = save_batch(tid, accepted)
+    mode = upload_jobs.submit(batch)
+    memory.update_thread(tid, pending_upload={
+        "upload_id": batch.batch_id, "text": text, "mode": mode,
+        "files": [{"name": f.name, "kind": f.kind, "pages": f.pages, "path": f.path} for f in batch.files]})
+    st.rerun()
+
+
+@st.fragment(run_every=1.5)
+def upload_progress(tid: str, upload_id: str) -> None:
+    s = upload_jobs.status(tid, upload_id)
+    if s.get("state") in ("done", "error"):
+        st.rerun(scope="app")  # hand the result to the agent
+    with st.container(key=f"upload_card_{upload_id}"):
+        st.markdown("**Reading your files…** you can keep chatting meanwhile.")
+        st.progress(int(s.get("progress", 0)) / 100, text=s.get("status", "Waiting to start"))
+
+
+def render_pending_upload(pending_question) -> bool:
+    """Show an upload that is still being read. When it's done, continue the conversation."""
+    tid = st.session_state["thread_id"]
+    pu = memory.get_thread(tid).get("pending_upload") or {}
+    if not pu or pending_question is not None:
+        return False
+    state = upload_jobs.status(tid, pu["upload_id"]).get("state")
+    with st.chat_message("user"):
+        render_user_message(pu.get("text", ""), pu["files"])
+    if state in ("done", "error"):
+        memory.update_thread(tid, pending_upload={})
+        run_turn(pu.get("text", ""), upload={**pu, "state": state}, show_user=False)
+        return True
+    with st.chat_message("assistant", avatar=AVATAR):
+        st.container(key="thinking_now").empty()
+        upload_progress(tid, pu["upload_id"])
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -544,8 +654,20 @@ def main() -> None:
 
     pending = state.interrupts[0] if state and state.interrupts else None
 
+    # A reply that was cut off (tab closed / connection lost mid-run): finish it from the checkpoint, once.
+    unfinished = bool(state and state.next and not state.interrupts)
+    resumed_key = f"resumed_{st.session_state['thread_id']}_{state.config['configurable'].get('checkpoint_id') if state else ''}"
+    if unfinished and not st.session_state.get(resumed_key):
+        st.session_state[resumed_key] = True
+        if messages:
+            render_history(messages)
+        st.caption(":material/replay: Finishing your last request...")
+        run_turn("", continue_run=True)
+        return
+
     picked = None
-    if not messages:
+    upload_waiting = bool(memory.get_thread(st.session_state["thread_id"]).get("pending_upload"))
+    if not messages and not upload_waiting:
         picked = render_welcome()
     else:
         if state.values.get("summary"):
@@ -553,14 +675,29 @@ def main() -> None:
         render_history(messages)
     if pending is not None:
         picked = render_pending_question(pending)
+    reading = render_pending_upload(pending)
 
+    for problem in st.session_state.pop("upload_problems", []) or []:
+        st.warning(problem, icon=":material/attach_file_off:")
+
+    cfg = upload_settings()
     max_chars = int(agents.load_settings().get("chat", {}).get("max_message_chars", 4000))
-    prompt = st.chat_input("Type your answer..." if pending else "Type your cabinet list, color, or a question...",
-                           max_chars=max_chars)
+    value = st.chat_input(
+        "Type your answer..." if pending else "Type your cabinet list, or attach a layout / photo / PDF...",
+        max_chars=max_chars,
+        accept_file=False if pending else "multiple",
+        file_type=None if pending else ["pdf"] + list(cfg["image_types"]),
+    )
+    prompt, files = (value, []) if (value is None or isinstance(value, str)) else (value.text or "", list(value.files))
+    if files:
+        start_upload((prompt or "")[:max_chars], files)
+        return
     if prompt and not prompt.strip():
         prompt = None
     if prompt and len(prompt) > max_chars:  # defence in depth (pasted text, API clients)
         prompt = prompt[:max_chars]
+    if reading and not prompt:
+        return
     if not pending and picked is None and messages:
         picked = render_suggestions(messages)
     text = prompt or picked

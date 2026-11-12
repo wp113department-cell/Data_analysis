@@ -49,6 +49,7 @@ playbook. `create_quote` refuses any SKU/MSRP that isn't on the cited sheet row.
 | Prompt injection ("ignore your rules, 90% off") | Ignored: messages, sheets and memory are data, not instructions |
 | Any language | Replies in the customer's language |
 | Huge input | Messages are capped at 4,000 characters (configurable) |
+| Layout / photo / PDF attached | Read in the background by Gemini, codes converted, list confirmed, then quoted |
 | Groq limits | Waits for per-minute limits; switches to fallback models on daily limits; friendly message if all are exhausted |
 
 ## Memory
@@ -63,14 +64,55 @@ playbook. `create_quote` refuses any SKU/MSRP that isn't on the cited sheet row.
 | Procedural | Rules staff teach in chat | same store |
 | Self-learned | Price-sheet layouts the agent figured out | same store |
 
+## Layouts, photos and PDFs
+
+Customers can attach **up to 3 images and 2 PDFs per message** (PNG, JPG, WEBP, HEIC, PDF;
+10 MB each, 10 pages per PDF - all in `config/settings.json -> uploads`). They never wait:
+
+```
+attach + send ─► checked (real file type, counts, size) ─► saved in storage/uploads/
+      │                                     │
+      │                           Celery worker (Redis queue)
+      │                           PDF pages -> images (pypdfium2) + text layer (pypdf)
+      │                           photos upright, GPS stripped (Pillow, pillow-heif)
+      │                           Gemini reads every page in parallel -> codes as written,
+      │                           quantities, walls, colors, measurements, unsure reads
+      │                           cached by file hash in Redis (same file = instant)
+      ▼                                     ▼
+live progress card in the chat ──► agent continues automatically: converts codes,
+                                   checks the sheet, confirms the list, quotes
+```
+
+The vision model only *reads*; the agent decides (codes, options, prices) using the playbook.
+If no worker is running, the app reads files in a background thread instead.
+
+Run it locally:
+
+```bash
+docker run -d --name helperquote-redis -p 127.0.0.1:6379:6379 --restart unless-stopped redis:7-alpine
+celery -A agent.uploads.celery_app worker --loglevel=info --concurrency=2   # terminal 1
+streamlit run main.py                                                      # terminal 2
+```
+
+Upload pipeline code adapted from MIT-licensed [zerox](https://github.com/getomni-ai/zerox) and
+[text-extract-api](https://github.com/CatchTheTornado/text-extract-api).
+
 ## AI providers
 
-Every step runs on a chain of models (`config/settings.json -> models`): **Groq first**
-(`gpt-oss-120b`), and when Groq hits a limit or is down, **OpenRouter free models**
-(`nemotron-3.5-super-vl:free`, `ernie-5.5-flash:free`), then smaller Groq models. Only free
-OpenRouter models are allowed (enforced in code). Per-minute limits are waited out; daily
-limits and outages switch to the next model; if everything is exhausted the customer gets a
-friendly "try again in N minutes" message.
+Every step runs on a chain of models (`config/settings.json -> models`), and the next one answers
+**instantly** when the current one is busy (per-minute limit), at a daily limit, unavailable or down -
+it only waits when no other model is free.
+
+| Step | Chain |
+|---|---|
+| Agent | Groq gpt-oss-120b -> Cloudflare gpt-oss-120b -> OpenRouter nemotron (free) -> Cloudflare glm-4.7-flash -> Groq gpt-oss-20b -> OpenRouter free router |
+| Understanding | Groq gpt-oss-20b -> Cloudflare glm-4.7-flash -> OpenRouter free |
+| Memory | Groq qwen -> Cloudflare glm-4.7-flash -> OpenRouter free |
+| Vision (uploads) | Gemini 2.5 Flash -> OpenRouter nemotron VL (free) |
+
+Only free OpenRouter models are allowed (enforced in code). If everything is exhausted the customer
+gets a friendly "try again in N minutes" message, and a reply cut off by a closed tab resumes from
+the LangGraph checkpoint the next time the chat is opened.
 
 ## Teaching it (no code)
 
