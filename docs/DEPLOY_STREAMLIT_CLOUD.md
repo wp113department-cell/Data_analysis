@@ -2,8 +2,8 @@
 
 For client testing. One shareable link, viewing can be limited to the client's email.
 
-> **The GitHub repo must be PRIVATE before the price workbook is committed** - it contains the
-> dealer pricing (multiplier). GitHub -> repo -> Settings -> General -> Danger Zone -> Change visibility.
+> The repo can stay public: the price workbook is committed only **encrypted**
+> (`price_lists/HCC.xlsm.enc`). The app unlocks it in memory with the `PRICE_SHEET_KEY` secret.
 
 ## How it runs on Streamlit Cloud
 
@@ -16,12 +16,12 @@ For client testing. One shareable link, viewing can be limited to the client's e
 
 ## Steps
 
-1. **Make the repo private** (see above), then commit the price workbook on the `Quote` branch.
+1. Deploy branch: **`staging`** (push changes there to update the staging app).
 2. Go to **https://share.streamlit.io** and sign in with the GitHub account that owns the repo
    (`wp113department-cell`).
 3. **Create app** -> *Deploy a public app from GitHub* is fine even for a private repo:
    - Repository: `wp113department-cell/Data_analysis`
-   - Branch: `Quote`
+   - Branch: `staging`
    - Main file path: `main.py`
    - Advanced settings -> Python version: **3.12**
 4. **Advanced settings -> Secrets** - paste this and fill in the values (never commit them):
@@ -32,6 +32,7 @@ For client testing. One shareable link, viewing can be limited to the client's e
    GEMINI_API_KEY = "..."
    CLOUDFLARE_API_TOKEN = "..."
    CLOUDFLARE_ACCOUNT_ID = "..."
+   PRICE_SHEET_KEY = "..."           # unlocks the encrypted price workbook
    STAFF_PIN = "choose-a-pin"        # optional: unlocks Staff mode (teach rules, see "Needs you")
    ```
 
@@ -42,11 +43,12 @@ For client testing. One shareable link, viewing can be limited to the client's e
 
 ## After deploying - quick checks
 
-- Sidebar shows **HCC** under *Price sheets (live)* with a green dot (the workbook was found).
+- Sidebar shows **HCC** under *Price sheets (live)* with a green dot (the encrypted workbook was unlocked).
 - Send "Merry Christmas!" (fast reply) and "quote 2 W2136 in white shaker, not assembled, pickup".
 - Attach a layout image - the progress card appears and the agent continues on its own.
 
 ## Updating the staging app
 
-Push to the `Quote` branch - Streamlit Cloud redeploys automatically. To change prices, update the
-workbook in the repo and push (or switch `config/settings.json` to a Google Sheet source).
+Push to the `staging` branch - Streamlit Cloud redeploys automatically. To change prices, update the
+workbook locally, re-run `python scripts/encrypt_price_sheet.py "Copy of HCC Signature Series Quote.xlsm"
+price_lists/HCC.xlsm.enc` (same key from `.env`), commit the `.enc` file and push.
